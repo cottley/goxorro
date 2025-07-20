@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,12 +17,19 @@ type CompressionStep struct {
 
 func main() {
 	var compressFlag bool
+	var decompressFlag bool
 	flag.BoolVar(&compressFlag, "c", false, "Compress source file to destination file")
+	flag.BoolVar(&decompressFlag, "d", false, "Decompress source file to destination file")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-c] <source> <destination>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-c|-d] <source> <destination>\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	if compressFlag && decompressFlag {
+		fmt.Fprintf(os.Stderr, "Error: Cannot use both -c and -d flags\n")
 		os.Exit(1)
 	}
 
@@ -33,12 +41,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if compressFlag {
-		if err := compressFile(sourceFile, destFile); err != nil {
-			fmt.Fprintf(os.Stderr, "Error compressing file: %v\n", err)
+	if decompressFlag {
+		if err := decompressFile(sourceFile, destFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Error decompressing file: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Successfully compressed '%s' to '%s'\n", sourceFile, destFile)
+		fmt.Printf("Successfully decompressed '%s' to '%s'\n", sourceFile, destFile)
 	} else {
 		if err := compressFile(sourceFile, destFile); err != nil {
 			fmt.Fprintf(os.Stderr, "Error compressing file: %v\n", err)
@@ -62,7 +70,7 @@ func compressFile(src, dst string) error {
 	defer destFile.Close()
 
 	buffer := make([]byte, 1024)
-	var compressionSteps []CompressionStep
+	var allCompressionSteps [][]CompressionStep
 
 	for {
 		n, err := sourceFile.Read(buffer)
@@ -75,7 +83,7 @@ func compressFile(src, dst string) error {
 
 		chunk := buffer[:n]
 		compressedData, steps := compressChunk(chunk)
-		compressionSteps = append(compressionSteps, steps...)
+		allCompressionSteps = append(allCompressionSteps, steps)
 
 		if err := binary.Write(destFile, binary.LittleEndian, int32(len(compressedData))); err != nil {
 			return err
@@ -83,6 +91,96 @@ func compressFile(src, dst string) error {
 		if _, err := destFile.Write(compressedData); err != nil {
 			return err
 		}
+	}
+
+	stepsJSON, err := json.Marshal(allCompressionSteps)
+	if err != nil {
+		return err
+	}
+
+	if _, err := destFile.Write(stepsJSON); err != nil {
+		return err
+	}
+	
+	if err := binary.Write(destFile, binary.LittleEndian, int32(len(stepsJSON))); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func decompressFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	stat, err := sourceFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	var metadataSize int32
+	if _, err := sourceFile.Seek(-4, io.SeekEnd); err != nil {
+		return err
+	}
+	if err := binary.Read(sourceFile, binary.LittleEndian, &metadataSize); err != nil {
+		return err
+	}
+
+	metadataStart := stat.Size() - int64(metadataSize) - 4
+	if _, err := sourceFile.Seek(metadataStart, io.SeekStart); err != nil {
+		return err
+	}
+
+	metadataBytes := make([]byte, metadataSize)
+	if _, err := io.ReadFull(sourceFile, metadataBytes); err != nil {
+		return err
+	}
+
+	var allCompressionSteps [][]CompressionStep
+	if err := json.Unmarshal(metadataBytes, &allCompressionSteps); err != nil {
+		return err
+	}
+
+	if _, err := sourceFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	chunkIndex := 0
+	for {
+		pos, _ := sourceFile.Seek(0, io.SeekCurrent)
+		if pos >= metadataStart {
+			break
+		}
+
+		var chunkSize int32
+		if err := binary.Read(sourceFile, binary.LittleEndian, &chunkSize); err != nil {
+			break
+		}
+
+		compressedData := make([]byte, chunkSize)
+		if _, err := sourceFile.Read(compressedData); err != nil {
+			return err
+		}
+
+		if chunkIndex >= len(allCompressionSteps) {
+			return fmt.Errorf("chunk index out of range")
+		}
+
+		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndex])
+		if _, err := destFile.Write(originalData); err != nil {
+			return err
+		}
+
+		chunkIndex++
 	}
 
 	return nil
@@ -189,5 +287,59 @@ func runLengthEncode(bits []int) []byte {
 	}
 	
 	result = append(result, byte(currentBit), byte(count))
+	return result
+}
+
+func decompressChunk(compressedData []byte, steps []CompressionStep) []byte {
+	bitStream := runLengthDecode(compressedData)
+	
+	for i := len(steps) - 1; i >= 0; i-- {
+		step := steps[i]
+		if step.Applied {
+			switch step.Operation {
+			case "xor":
+				xorPattern := createXORPattern(len(bitStream), step.Prime)
+				bitStream = xorBits(bitStream, xorPattern)
+			case "negate":
+				bitStream = negateBits(bitStream)
+			}
+		}
+	}
+	
+	return bitsToBytes(bitStream)
+}
+
+func runLengthDecode(data []byte) []int {
+	var bits []int
+	
+	for i := 0; i < len(data); i += 2 {
+		if i+1 >= len(data) {
+			break
+		}
+		
+		bit := int(data[i])
+		count := int(data[i+1])
+		
+		for j := 0; j < count; j++ {
+			bits = append(bits, bit)
+		}
+	}
+	
+	return bits
+}
+
+func bitsToBytes(bits []int) []byte {
+	var result []byte
+	
+	for i := 0; i < len(bits); i += 8 {
+		var b byte
+		for j := 0; j < 8 && i+j < len(bits); j++ {
+			if bits[i+j] == 1 {
+				b |= 1 << (7 - j)
+			}
+		}
+		result = append(result, b)
+	}
+	
 	return result
 }
