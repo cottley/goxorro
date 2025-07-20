@@ -175,7 +175,6 @@ func main() {
 			os.Exit(1)
 		}
 		logDebug("Decompression completed successfully")
-		fmt.Printf("Successfully decompressed '%s' to '%s'\n", sourceFile, destFile)
 	} else {
 		logDebug("Starting compression: %s -> %s", sourceFile, destFile)
 		if err := compressFile(sourceFile, destFile); err != nil {
@@ -184,7 +183,6 @@ func main() {
 			os.Exit(1)
 		}
 		logDebug("Compression completed successfully")
-		fmt.Printf("Successfully compressed '%s' to '%s'\n", sourceFile, destFile)
 	}
 }
 
@@ -202,13 +200,19 @@ func compressFile(src, dst string) error {
 	defer destFile.Close()
 
 	stat, err := sourceFile.Stat()
-	if err == nil {
-		logDebug("Source file size: %d bytes", stat.Size())
+	if err != nil {
+		return err
 	}
+	fileSize := stat.Size()
+	totalChunks := (fileSize + 1023) / 1024
+	logDebug("Source file size: %d bytes (%d chunks)", fileSize, totalChunks)
+
+	fmt.Printf("Compressing %d bytes in %d chunks...\n", fileSize, totalChunks)
 
 	buffer := make([]byte, 1024)
 	var allCompressionSteps [][]CompressionStep
 	chunkCount := 0
+	bytesProcessed := int64(0)
 
 	for {
 		n, err := sourceFile.Read(buffer)
@@ -220,6 +224,10 @@ func compressFile(src, dst string) error {
 		}
 
 		chunk := buffer[:n]
+		bytesProcessed += int64(n)
+		progress := float64(bytesProcessed) / float64(fileSize) * 100
+		
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", progress, chunkCount+1, totalChunks)
 		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
 		
 		start := time.Now()
@@ -243,6 +251,8 @@ func compressFile(src, dst string) error {
 		chunkCount++
 	}
 
+	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Writing metadata...\n", totalChunks, totalChunks)
+
 	metadataBytes := encodeMetadata(allCompressionSteps)
 	logDebug("Metadata encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
 
@@ -257,6 +267,9 @@ func compressFile(src, dst string) error {
 	finalStat, err := destFile.Stat()
 	if err == nil {
 		logDebug("Final compressed file size: %d bytes", finalStat.Size())
+		fmt.Printf("Compression complete: %d -> %d bytes (%.1f%% reduction)\n", 
+			fileSize, finalStat.Size(), 
+			(1.0-float64(finalStat.Size())/float64(fileSize))*100)
 	}
 
 	return nil
@@ -304,7 +317,10 @@ func decompressFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	logDebug("Decoded metadata for %d chunks", len(allCompressionSteps))
+	totalChunks := len(allCompressionSteps)
+	logDebug("Decoded metadata for %d chunks", totalChunks)
+
+	fmt.Printf("Decompressing %d chunks...\n", totalChunks)
 
 	if _, err := sourceFile.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -332,6 +348,9 @@ func decompressFile(src, dst string) error {
 			return fmt.Errorf("chunk index out of range")
 		}
 
+		progress := float64(chunkIndex+1) / float64(totalChunks) * 100
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", progress, chunkIndex+1, totalChunks)
+		
 		logDebug("Decompressing chunk %d: %d bytes compressed", chunkIndex, chunkSize)
 		start := time.Now()
 		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndex])
@@ -347,6 +366,8 @@ func decompressFile(src, dst string) error {
 		totalDecompressed += len(originalData)
 		chunkIndex++
 	}
+
+	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Complete!\n", totalChunks, totalChunks)
 
 	logDebug("Decompression complete: %d chunks, %d total bytes", chunkIndex, totalDecompressed)
 	return nil
