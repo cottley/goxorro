@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"time"
 )
 
 type CompressionStep struct {
@@ -17,6 +19,8 @@ type CompressionStep struct {
 }
 
 var primes []int
+var debugLogger *log.Logger
+var verboseMode bool
 
 func init() {
 	primes = generatePrimes(1029)
@@ -71,7 +75,12 @@ func main() {
 	var decompressFlag bool
 	flag.BoolVar(&compressFlag, "c", false, "Compress source file to destination file")
 	flag.BoolVar(&decompressFlag, "d", false, "Decompress source file to destination file")
+	flag.BoolVar(&verboseMode, "v", false, "Enable verbose logging to debug.log")
 	flag.Parse()
+
+	if verboseMode {
+		initDebugLogging()
+	}
 
 	args := flag.Args()
 	if len(args) != 2 {
@@ -93,16 +102,22 @@ func main() {
 	}
 
 	if decompressFlag {
+		logDebug("Starting decompression: %s -> %s", sourceFile, destFile)
 		if err := decompressFile(sourceFile, destFile); err != nil {
+			logDebug("Decompression failed: %v", err)
 			fmt.Fprintf(os.Stderr, "Error decompressing file: %v\n", err)
 			os.Exit(1)
 		}
+		logDebug("Decompression completed successfully")
 		fmt.Printf("Successfully decompressed '%s' to '%s'\n", sourceFile, destFile)
 	} else {
+		logDebug("Starting compression: %s -> %s", sourceFile, destFile)
 		if err := compressFile(sourceFile, destFile); err != nil {
+			logDebug("Compression failed: %v", err)
 			fmt.Fprintf(os.Stderr, "Error compressing file: %v\n", err)
 			os.Exit(1)
 		}
+		logDebug("Compression completed successfully")
 		fmt.Printf("Successfully compressed '%s' to '%s'\n", sourceFile, destFile)
 	}
 }
@@ -120,8 +135,14 @@ func compressFile(src, dst string) error {
 	}
 	defer destFile.Close()
 
+	stat, err := sourceFile.Stat()
+	if err == nil {
+		logDebug("Source file size: %d bytes", stat.Size())
+	}
+
 	buffer := make([]byte, 1024)
 	var allCompressionSteps [][]CompressionStep
+	chunkCount := 0
 
 	for {
 		n, err := sourceFile.Read(buffer)
@@ -133,7 +154,17 @@ func compressFile(src, dst string) error {
 		}
 
 		chunk := buffer[:n]
+		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
+		
+		start := time.Now()
 		compressedData, steps := compressChunk(chunk)
+		duration := time.Since(start)
+		
+		logDebug("Chunk %d compressed: %d -> %d bytes (%.3f ratio) in %v", 
+			chunkCount, len(chunk), len(compressedData), 
+			float64(len(compressedData))/float64(len(chunk)), duration)
+		logDebug("Chunk %d compression steps: %d operations", chunkCount, len(steps))
+		
 		allCompressionSteps = append(allCompressionSteps, steps)
 
 		if err := binary.Write(destFile, binary.LittleEndian, int32(len(compressedData))); err != nil {
@@ -142,9 +173,12 @@ func compressFile(src, dst string) error {
 		if _, err := destFile.Write(compressedData); err != nil {
 			return err
 		}
+		
+		chunkCount++
 	}
 
 	metadataBytes := encodeMetadata(allCompressionSteps)
+	logDebug("Metadata encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
 
 	if _, err := destFile.Write(metadataBytes); err != nil {
 		return err
@@ -152,6 +186,11 @@ func compressFile(src, dst string) error {
 	
 	if err := binary.Write(destFile, binary.LittleEndian, int32(len(metadataBytes))); err != nil {
 		return err
+	}
+
+	finalStat, err := destFile.Stat()
+	if err == nil {
+		logDebug("Final compressed file size: %d bytes", finalStat.Size())
 	}
 
 	return nil
@@ -174,6 +213,7 @@ func decompressFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	logDebug("Compressed file size: %d bytes", stat.Size())
 
 	var metadataSize int32
 	if _, err := sourceFile.Seek(-4, io.SeekEnd); err != nil {
@@ -182,6 +222,7 @@ func decompressFile(src, dst string) error {
 	if err := binary.Read(sourceFile, binary.LittleEndian, &metadataSize); err != nil {
 		return err
 	}
+	logDebug("Metadata size: %d bytes", metadataSize)
 
 	metadataStart := stat.Size() - int64(metadataSize) - 4
 	if _, err := sourceFile.Seek(metadataStart, io.SeekStart); err != nil {
@@ -197,12 +238,14 @@ func decompressFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	logDebug("Decoded metadata for %d chunks", len(allCompressionSteps))
 
 	if _, err := sourceFile.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 
 	chunkIndex := 0
+	totalDecompressed := 0
 	for {
 		pos, _ := sourceFile.Seek(0, io.SeekCurrent)
 		if pos >= metadataStart {
@@ -223,14 +266,23 @@ func decompressFile(src, dst string) error {
 			return fmt.Errorf("chunk index out of range")
 		}
 
+		logDebug("Decompressing chunk %d: %d bytes compressed", chunkIndex, chunkSize)
+		start := time.Now()
 		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndex])
+		duration := time.Since(start)
+		
+		logDebug("Chunk %d decompressed: %d -> %d bytes in %v", 
+			chunkIndex, chunkSize, len(originalData), duration)
+		
 		if _, err := destFile.Write(originalData); err != nil {
 			return err
 		}
 
+		totalDecompressed += len(originalData)
 		chunkIndex++
 	}
 
+	logDebug("Decompression complete: %d chunks, %d total bytes", chunkIndex, totalDecompressed)
 	return nil
 }
 
@@ -239,16 +291,24 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 	bitStream := bytesToBits(data)
 	
 	ones, zeros := countBits(bitStream)
+	logDebug("Initial bit distribution: %d ones, %d zeros (%.1f%% ones)", 
+		ones, zeros, float64(ones)/float64(len(bitStream))*100)
+	
 	if ones > zeros {
 		bitStream = negateBits(bitStream)
 		steps = append(steps, CompressionStep{Operation: "negate", Applied: true})
+		logDebug("Applied negation: %d zeros, %d ones", ones, zeros)
 	}
 
 	
 	for iteration := 0; iteration < 10; iteration++ {
+		logDebug("XOR iteration %d: testing primes for bit stream with %d bits", 
+			iteration, len(bitStream))
+		
 		bestPrime := -1
 		bestZeros := 0
 		var bestResult []int
+		primesChecked := 0
 		
 		for i, prime := range primes {
 			if prime > 1000 && iteration == 0 {
@@ -259,22 +319,32 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 			testResult := xorBits(bitStream, xorPattern)
 			
 			_, zeros := countBits(testResult)
+			primesChecked++
+			
 			if zeros > bestZeros {
 				bestZeros = zeros
 				bestPrime = prime
 				bestResult = testResult
+				logDebug("New best prime %d: %d zeros (%.1f%%)", 
+					prime, zeros, float64(zeros)/float64(len(bitStream))*100)
 				
 				if zeros > len(bitStream)*85/100 {
+					logDebug("Excellent pattern found (>85%% zeros), stopping early")
 					break
 				}
 			}
 			
 			if i > 100 && bestZeros > len(bitStream)*60/100 {
+				logDebug("Good pattern found after 100 primes (>60%% zeros), stopping")
 				break
 			}
 		}
 		
+		logDebug("Iteration %d complete: checked %d primes, best was %d with %d zeros", 
+			iteration, primesChecked, bestPrime, bestZeros)
+		
 		if bestPrime == -1 || bestZeros <= len(bitStream)/2 {
+			logDebug("No improvement found, stopping iterations")
 			break
 		}
 		
@@ -282,6 +352,8 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 		steps = append(steps, CompressionStep{Operation: "xor", Prime: bestPrime, Applied: true})
 		
 		if isSparseBitStream(bitStream) {
+			logDebug("Bit stream is now sparse (<%0.1f%% ones), stopping", 
+				float64(countOnes(bitStream))/float64(len(bitStream))*100)
 			break
 		}
 	}
@@ -309,6 +381,16 @@ func countBits(bits []int) (ones, zeros int) {
 		}
 	}
 	return
+}
+
+func countOnes(bits []int) int {
+	ones := 0
+	for _, bit := range bits {
+		if bit == 1 {
+			ones++
+		}
+	}
+	return ones
 }
 
 func negateBits(bits []int) []int {
@@ -496,4 +578,23 @@ func gzipDecompress(data []byte) []int {
 	}
 	
 	return allBits
+}
+
+func initDebugLogging() {
+	logFile, err := os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Could not create debug.log: %v\n", err)
+		return
+	}
+	
+	debugLogger = log.New(logFile, "", log.LstdFlags|log.Lmicroseconds)
+	debugLogger.Printf("=== goxorro debug session started ===")
+	debugLogger.Printf("Command: %v", os.Args)
+	debugLogger.Printf("Generated %d prime numbers (2 to %d)", len(primes), primes[len(primes)-1])
+}
+
+func logDebug(format string, args ...interface{}) {
+	if verboseMode && debugLogger != nil {
+		debugLogger.Printf(format, args...)
+	}
 }

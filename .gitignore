@@ -33,3 +33,6 @@ go.work.sum
 CLAUDE.md
 goxorro
 .claude/
+data/
+debug.log
+
