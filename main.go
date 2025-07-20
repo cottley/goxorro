@@ -219,6 +219,7 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 
 	buffer := make([]byte, 1024)
 	var allCompressionSteps [][]CompressionStep
+	var allSparseData [][]byte
 	chunkCount := 0
 	bytesProcessed := int64(0)
 	var avgChunkTime time.Duration
@@ -272,36 +273,53 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 		logDebug("Chunk %d compression steps: %d operations", chunkCount, len(steps))
 		
 		allCompressionSteps = append(allCompressionSteps, steps)
-
-		// Write compressed data with length delimiter
-		if err := binary.Write(destFile, binary.LittleEndian, uint32(len(compressedData))); err != nil {
-			return err
-		}
-		if _, err := destFile.Write(compressedData); err != nil {
-			return err
-		}
+		allSparseData = append(allSparseData, compressedData)
 		
 		chunkCount++
 	}
 
-	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Writing metadata...\n", totalChunks, totalChunks)
+	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Writing format v2...\n", totalChunks, totalChunks)
 
-	// Write delimiter marker to separate data section from metadata section
-	delimiter := []byte("GOXORRO_META_START")
-	if _, err := destFile.Write(delimiter); err != nil {
-		return err
-	}
-
-	// Write metadata section
-	metadataBytes := encodeMetadataWithDelimiters(allCompressionSteps)
-	logDebug("Metadata encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
-
-	if _, err := destFile.Write(metadataBytes); err != nil {
-		return err
-	}
-
-	// Close the raw XOR file
+	// Close temporary file and create final output with format v2
 	destFile.Close()
+	
+	// Create final output file
+	finalFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer finalFile.Close()
+	
+	// Write version byte (1 for format v2)
+	if _, err := finalFile.Write([]byte{1}); err != nil {
+		return err
+	}
+	logDebug("Written format version: 1")
+	
+	// Write original file size (4 bytes, uint32 little endian)
+	if err := binary.Write(finalFile, binary.LittleEndian, uint32(fileSize)); err != nil {
+		return err
+	}
+	logDebug("Written original file size: %d bytes", fileSize)
+	
+	// Write sparse data section (each chunk padded to 1024 bytes)
+	for i, sparseChunk := range allSparseData {
+		// Pad chunk to 1024 bytes
+		paddedChunk := make([]byte, 1024)
+		copy(paddedChunk, sparseChunk)
+		if _, err := finalFile.Write(paddedChunk); err != nil {
+			return err
+		}
+		logDebug("Written sparse chunk %d: %d bytes (padded to 1024)", i, len(sparseChunk))
+	}
+	
+	// Write metadata section with bit packing
+	metadataBytes := encodeMetadataV2(allCompressionSteps)
+	logDebug("Metadata v2 encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
+
+	if _, err := finalFile.Write(metadataBytes); err != nil {
+		return err
+	}
 	
 	// Get raw file size
 	rawStat, err := os.Stat(dst)
@@ -509,12 +527,122 @@ func decompressFile(src, dst string) error {
 	}
 	logDebug("Compressed file size: %d bytes", stat.Size())
 
-	// Find the metadata delimiter
-	delimiter := []byte("GOXORRO_META_START")
+	// Read all file content
 	file_content, err := io.ReadAll(sourceFile)
 	if err != nil {
 		return err
 	}
+	
+	if len(file_content) < 5 {
+		return fmt.Errorf("file too short to contain valid header")
+	}
+	
+	// Check format version
+	version := file_content[0]
+	logDebug("File format version: %d", version)
+	
+	if version == 1 {
+		// New format v2
+		return decompressFileV2(file_content, destFile)
+	} else {
+		// Try old format with delimiter
+		return decompressFileV1(file_content, destFile)
+	}
+}
+
+func decompressFileV2(file_content []byte, destFile *os.File) error {
+	// Read original file size (4 bytes after version byte)
+	originalSize := binary.LittleEndian.Uint32(file_content[1:5])
+	logDebug("Original file size: %d bytes", originalSize)
+	
+	// Calculate number of chunks
+	numChunks := int((originalSize + 1023) / 1024)
+	logDebug("Expected chunks: %d", numChunks)
+	
+	// Calculate sparse data size (each chunk is 1024 bytes)
+	sparseDataSize := numChunks * 1024
+	sparseDataStart := 5 // after version (1) + original size (4)
+	sparseDataEnd := sparseDataStart + sparseDataSize
+	
+	if sparseDataEnd > len(file_content) {
+		return fmt.Errorf("file too short for expected sparse data")
+	}
+	
+	sparseData := file_content[sparseDataStart:sparseDataEnd]
+	metadataBytes := file_content[sparseDataEnd:]
+	logDebug("Sparse data: %d bytes, Metadata: %d bytes", len(sparseData), len(metadataBytes))
+	
+	// Decode metadata
+	allCompressionSteps, err := decodeMetadataV2(metadataBytes, numChunks)
+	if err != nil {
+		return err
+	}
+	logDebug("Decoded metadata for %d chunks", len(allCompressionSteps))
+	
+	fmt.Printf("Decompressing %d chunks...\n", numChunks)
+	
+	// Process each chunk
+	var avgDecompTime time.Duration
+	totalDecompressed := 0
+	
+	for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
+		// Extract sparse chunk (1024 bytes each)
+		chunkStart := chunkIndex * 1024
+		chunkEnd := chunkStart + 1024
+		compressedChunk := sparseData[chunkStart:chunkEnd]
+		
+		logDebug("Decompressing chunk %d: 1024 bytes", chunkIndex)
+		start := time.Now()
+		originalData := decompressChunk(compressedChunk, allCompressionSteps[chunkIndex])
+		duration := time.Since(start)
+		
+		// Calculate decompression time estimates
+		if chunkIndex == 0 {
+			avgDecompTime = duration
+		} else {
+			avgDecompTime = (avgDecompTime*time.Duration(chunkIndex) + duration) / time.Duration(chunkIndex+1)
+		}
+		
+		remainingChunks := numChunks - (chunkIndex + 1)
+		estimatedRemaining := avgDecompTime * time.Duration(remainingChunks)
+		progress := float64(chunkIndex+1) / float64(numChunks) * 100
+		
+		// Format time estimates for decompression
+		timeStr := ""
+		if chunkIndex > 1 && remainingChunks > 0 {
+			if estimatedRemaining < time.Minute {
+				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
+			} else {
+				timeStr = fmt.Sprintf(" ETA: %dm%ds", int(estimatedRemaining.Minutes()), int(estimatedRemaining.Seconds())%60)
+			}
+		}
+		
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkIndex+1, numChunks, timeStr)
+		
+		logDebug("Chunk %d decompressed: 1024 -> %d bytes in %v", 
+			chunkIndex, len(originalData), duration)
+		
+		// Only write the actual data (may be less than 1024 for last chunk)
+		actualSize := len(originalData)
+		if int64(totalDecompressed + actualSize) > int64(originalSize) {
+			actualSize = int(originalSize) - totalDecompressed
+		}
+		
+		if _, err := destFile.Write(originalData[:actualSize]); err != nil {
+			return err
+		}
+		
+		totalDecompressed += actualSize
+	}
+	
+	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Complete!\n", numChunks, numChunks)
+	logDebug("Decompression complete: %d chunks, %d total bytes", numChunks, totalDecompressed)
+	return nil
+}
+
+func decompressFileV1(file_content []byte, destFile *os.File) error {
+	// Find the metadata delimiter
+	delimiter := []byte("GOXORRO_META_START")
 	
 	// Find delimiter position
 	delimiterPos := -1
@@ -540,60 +668,60 @@ func decompressFile(src, dst string) error {
 	}
 	totalChunks := len(allCompressionSteps)
 	logDebug("Decoded metadata for %d chunks", totalChunks)
-
+	
 	fmt.Printf("Decompressing %d chunks...\n", totalChunks)
 
 	// Process data section (before delimiter)
 	dataSection := file_content[:delimiterPos]
 	logDebug("Data section size: %d bytes", len(dataSection))
 	
-	chunkIndex := 0
-	totalDecompressed := 0
-	var avgDecompTime time.Duration
-	dataOffset := 0
+	chunkIndexV1 := 0
+	totalDecompressedV1 := 0
+	var avgDecompTimeV1 time.Duration
+	dataOffsetV1 := 0
 	
-	for chunkIndex < totalChunks {
-		if dataOffset >= len(dataSection) {
+	for chunkIndexV1 < totalChunks {
+		if dataOffsetV1 >= len(dataSection) {
 			break
 		}
 
 		// Read chunk size (4 bytes, uint32 little endian)
-		if dataOffset+4 > len(dataSection) {
+		if dataOffsetV1+4 > len(dataSection) {
 			break
 		}
-		chunkSize := binary.LittleEndian.Uint32(dataSection[dataOffset:dataOffset+4])
-		dataOffset += 4
+		chunkSize := binary.LittleEndian.Uint32(dataSection[dataOffsetV1:dataOffsetV1+4])
+		dataOffsetV1 += 4
 
 		// Read compressed data
-		if dataOffset+int(chunkSize) > len(dataSection) {
+		if dataOffsetV1+int(chunkSize) > len(dataSection) {
 			return fmt.Errorf("chunk data extends beyond data section")
 		}
-		compressedData := dataSection[dataOffset:dataOffset+int(chunkSize)]
-		dataOffset += int(chunkSize)
+		compressedData := dataSection[dataOffsetV1:dataOffsetV1+int(chunkSize)]
+		dataOffsetV1 += int(chunkSize)
 
-		if chunkIndex >= len(allCompressionSteps) {
+		if chunkIndexV1 >= len(allCompressionSteps) {
 			return fmt.Errorf("chunk index out of range")
 		}
 
-		logDebug("Decompressing chunk %d: %d bytes compressed", chunkIndex, chunkSize)
+		logDebug("Decompressing chunk %d: %d bytes compressed", chunkIndexV1, chunkSize)
 		start := time.Now()
-		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndex])
+		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndexV1])
 		duration := time.Since(start)
 		
 		// Calculate decompression time estimates
-		if chunkIndex == 0 {
-			avgDecompTime = duration
+		if chunkIndexV1 == 0 {
+			avgDecompTimeV1 = duration
 		} else {
-			avgDecompTime = (avgDecompTime*time.Duration(chunkIndex) + duration) / time.Duration(chunkIndex+1)
+			avgDecompTimeV1 = (avgDecompTimeV1*time.Duration(chunkIndexV1) + duration) / time.Duration(chunkIndexV1+1)
 		}
 		
-		remainingChunks := totalChunks - (chunkIndex + 1)
-		estimatedRemaining := avgDecompTime * time.Duration(remainingChunks)
-		progress := float64(chunkIndex+1) / float64(totalChunks) * 100
+		remainingChunks := totalChunks - (chunkIndexV1 + 1)
+		estimatedRemaining := avgDecompTimeV1 * time.Duration(remainingChunks)
+		progress := float64(chunkIndexV1+1) / float64(totalChunks) * 100
 		
 		// Format time estimates for decompression
 		timeStr := ""
-		if chunkIndex > 1 && remainingChunks > 0 {
+		if chunkIndexV1 > 1 && remainingChunks > 0 {
 			if estimatedRemaining < time.Minute {
 				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
 			} else {
@@ -601,22 +729,22 @@ func decompressFile(src, dst string) error {
 			}
 		}
 		
-		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkIndex+1, totalChunks, timeStr)
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkIndexV1+1, totalChunks, timeStr)
 		
 		logDebug("Chunk %d decompressed: %d -> %d bytes in %v", 
-			chunkIndex, chunkSize, len(originalData), duration)
+			chunkIndexV1, int(chunkSize), len(originalData), duration)
 		
 		if _, err := destFile.Write(originalData); err != nil {
 			return err
 		}
 
-		totalDecompressed += len(originalData)
-		chunkIndex++
+		totalDecompressedV1 += len(originalData)
+		chunkIndexV1++
 	}
 
 	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Complete!\n", totalChunks, totalChunks)
 
-	logDebug("Decompression complete: %d chunks, %d total bytes", chunkIndex, totalDecompressed)
+	logDebug("Decompression complete: %d chunks, %d total bytes", chunkIndexV1, totalDecompressedV1)
 	return nil
 }
 
@@ -929,6 +1057,61 @@ func encodeMetadataWithDelimiters(allSteps [][]CompressionStep) []byte {
 	return result
 }
 
+func encodeMetadataV2(allSteps [][]CompressionStep) []byte {
+	var result []byte
+	
+	// Count total operations across all chunks
+	totalOps := 0
+	for _, steps := range allSteps {
+		totalOps += len(steps)
+	}
+	
+	// Write total operation count (2 bytes, uint16 little endian)
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, uint16(totalOps))
+	result = append(result, buf...)
+	logDebug("Total operations: %d", totalOps)
+	
+	// Bit pack all operations
+	bitBuffer := make([]int, 0)
+	
+	for chunkIndex, steps := range allSteps {
+		logDebug("Encoding chunk %d with %d operations", chunkIndex, len(steps))
+		
+		for _, step := range steps {
+			if step.Operation == "negate" && step.Applied {
+				// Negate operation: 1 bit (1)
+				bitBuffer = append(bitBuffer, 1)
+				logDebug("Added negate bit: 1")
+			} else if step.Operation == "xor" && step.Applied {
+				// XOR operation: 1 bit (0) + 11 bits for prime index
+				bitBuffer = append(bitBuffer, 0)
+				primeIndex := getPrimeIndex(step.Prime)
+				// Pack 11-bit prime index
+				for i := 10; i >= 0; i-- {
+					bit := (primeIndex >> i) & 1
+					bitBuffer = append(bitBuffer, bit)
+				}
+				logDebug("Added XOR operation: prime %d (index %d)", step.Prime, primeIndex)
+			}
+		}
+	}
+	
+	// Convert bit buffer to bytes
+	for i := 0; i < len(bitBuffer); i += 8 {
+		var b byte
+		for j := 0; j < 8 && i+j < len(bitBuffer); j++ {
+			if bitBuffer[i+j] == 1 {
+				b |= 1 << (7 - j)
+			}
+		}
+		result = append(result, b)
+	}
+	
+	logDebug("Metadata v2 bit buffer: %d bits, packed into %d bytes", len(bitBuffer), len(result)-2)
+	return result
+}
+
 func encodeMetadata(allSteps [][]CompressionStep) []byte {
 	var result []byte
 	
@@ -961,6 +1144,80 @@ func encodeMetadata(allSteps [][]CompressionStep) []byte {
 	}
 	
 	return result
+}
+
+func decodeMetadataV2(data []byte, numChunks int) ([][]CompressionStep, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("metadata too short")
+	}
+	
+	// Read total operation count (2 bytes, uint16 little endian)
+	totalOps := int(binary.LittleEndian.Uint16(data[0:2]))
+	logDebug("Total operations to decode: %d", totalOps)
+	
+	// Convert bytes back to bit stream
+	bitBuffer := make([]int, 0)
+	for i := 2; i < len(data); i++ {
+		b := data[i]
+		for j := 7; j >= 0; j-- {
+			bit := int((b >> j) & 1)
+			bitBuffer = append(bitBuffer, bit)
+		}
+	}
+	
+	logDebug("Decoded %d bits from metadata", len(bitBuffer))
+	
+	// Parse operations from bit stream
+	allSteps := make([][]CompressionStep, numChunks)
+	bitPos := 0
+	opsRead := 0
+	currentChunk := 0
+	opsPerChunk := totalOps / numChunks
+	if totalOps % numChunks != 0 {
+		opsPerChunk++
+	}
+	
+	for opsRead < totalOps && bitPos < len(bitBuffer) && currentChunk < numChunks {
+		if bitPos >= len(bitBuffer) {
+			break
+		}
+		
+		if bitBuffer[bitPos] == 1 {
+			// Negate operation
+			allSteps[currentChunk] = append(allSteps[currentChunk], 
+				CompressionStep{Operation: "negate", Applied: true})
+			bitPos++
+			logDebug("Decoded negate operation for chunk %d", currentChunk)
+		} else {
+			// XOR operation: skip the 0 bit, read 11 bits for prime index
+			bitPos++ // skip the 0 bit
+			if bitPos+11 > len(bitBuffer) {
+				return nil, fmt.Errorf("insufficient bits for prime index")
+			}
+			
+			primeIndex := 0
+			for i := 0; i < 11; i++ {
+				primeIndex = (primeIndex << 1) | bitBuffer[bitPos+i]
+			}
+			bitPos += 11
+			
+			if primeIndex < len(primes) {
+				allSteps[currentChunk] = append(allSteps[currentChunk],
+					CompressionStep{Operation: "xor", Prime: primes[primeIndex], Applied: true})
+				logDebug("Decoded XOR operation for chunk %d: prime %d (index %d)", 
+					currentChunk, primes[primeIndex], primeIndex)
+			}
+		}
+		
+		opsRead++
+		
+		// Move to next chunk based on estimated operations per chunk
+		if len(allSteps[currentChunk]) >= opsPerChunk && currentChunk < numChunks-1 {
+			currentChunk++
+		}
+	}
+	
+	return allSteps, nil
 }
 
 func decodeMetadataWithDelimiters(data []byte) ([][]CompressionStep, error) {
