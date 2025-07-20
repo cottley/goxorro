@@ -15,7 +15,45 @@ type CompressionStep struct {
 	Applied   bool
 }
 
-var primes = []int{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
+var primes []int
+
+func init() {
+	primes = generatePrimes(1029)
+}
+
+func generatePrimes(count int) []int {
+	var primes []int
+	num := 2
+	
+	for len(primes) < count {
+		if isPrime(num) {
+			primes = append(primes, num)
+		}
+		num++
+	}
+	
+	return primes
+}
+
+func isPrime(n int) bool {
+	if n < 2 {
+		return false
+	}
+	if n == 2 {
+		return true
+	}
+	if n%2 == 0 {
+		return false
+	}
+	
+	for i := 3; i*i <= n; i += 2 {
+		if n%i == 0 {
+			return false
+		}
+	}
+	
+	return true
+}
 
 type HuffmanNode struct {
 	Value     int
@@ -241,15 +279,41 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 	}
 
 	
-	for _, prime := range primes {
-		xorPattern := createXORPattern(len(bitStream), prime)
-		testResult := xorBits(bitStream, xorPattern)
+	for iteration := 0; iteration < 10; iteration++ {
+		bestPrime := -1
+		bestZeros := 0
+		var bestResult []int
 		
-		testOnes, testZeros := countBits(testResult)
-		if testZeros > testOnes {
-			bitStream = testResult
-			steps = append(steps, CompressionStep{Operation: "xor", Prime: prime, Applied: true})
+		for i, prime := range primes {
+			if prime > 1000 && iteration == 0 {
+				continue
+			}
+			
+			xorPattern := createXORPattern(len(bitStream), prime)
+			testResult := xorBits(bitStream, xorPattern)
+			
+			_, zeros := countBits(testResult)
+			if zeros > bestZeros {
+				bestZeros = zeros
+				bestPrime = prime
+				bestResult = testResult
+				
+				if zeros > len(bitStream)*85/100 {
+					break
+				}
+			}
+			
+			if i > 100 && bestZeros > len(bitStream)*60/100 {
+				break
+			}
 		}
+		
+		if bestPrime == -1 || bestZeros <= len(bitStream)/2 {
+			break
+		}
+		
+		bitStream = bestResult
+		steps = append(steps, CompressionStep{Operation: "xor", Prime: bestPrime, Applied: true})
 		
 		if isSparseBitStream(bitStream) {
 			break
@@ -445,8 +509,10 @@ func encodeMetadata(allSteps [][]CompressionStep) []byte {
 		
 		for _, step := range xorSteps {
 			primeIndex := getPrimeIndex(step.Prime)
-			if primeIndex >= 0 && primeIndex < 11 {
-				result = append(result, byte(primeIndex))
+			if primeIndex >= 0 && primeIndex < len(primes) {
+				indexBytes := make([]byte, 2)
+				binary.LittleEndian.PutUint16(indexBytes, uint16(primeIndex))
+				result = append(result, indexBytes...)
 			}
 		}
 	}
@@ -472,7 +538,7 @@ func decodeMetadata(data []byte) ([][]CompressionStep, error) {
 		numXorSteps := int(data[offset+1])
 		offset += 2
 		
-		if offset+numXorSteps > len(data) {
+		if offset+numXorSteps*2 > len(data) {
 			return nil, fmt.Errorf("invalid metadata: insufficient XOR step data")
 		}
 		
@@ -483,7 +549,7 @@ func decodeMetadata(data []byte) ([][]CompressionStep, error) {
 		}
 		
 		for j := 0; j < numXorSteps; j++ {
-			primeIndex := int(data[offset+j])
+			primeIndex := int(binary.LittleEndian.Uint16(data[offset+j*2 : offset+j*2+2]))
 			if primeIndex < len(primes) {
 				steps = append(steps, CompressionStep{
 					Operation: "xor",
@@ -493,7 +559,7 @@ func decodeMetadata(data []byte) ([][]CompressionStep, error) {
 			}
 		}
 		
-		offset += numXorSteps
+		offset += numXorSteps * 2
 		allSteps = append(allSteps, steps)
 	}
 	
