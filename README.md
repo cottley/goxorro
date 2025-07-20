@@ -31,14 +31,14 @@ This will create a self-contained binary named `goxorro`.
 
 ### Examples
 
-Copy a file:
+Compress a file:
 ```bash
-./goxorro source.txt destination.txt
+./goxorro source.txt destination.xor
 ```
 
-Copy a file with explicit `-c` flag:
+Compress a file with explicit `-c` flag:
 ```bash
-./goxorro -c source.txt destination.txt
+./goxorro -c source.txt destination.xor
 ```
 
 ## Error Handling
