@@ -264,7 +264,8 @@ func compressFile(src, dst string) error {
 		
 		allCompressionSteps = append(allCompressionSteps, steps)
 
-		if err := binary.Write(destFile, binary.LittleEndian, int32(len(compressedData))); err != nil {
+		// Write compressed data with length delimiter
+		if err := binary.Write(destFile, binary.LittleEndian, uint32(len(compressedData))); err != nil {
 			return err
 		}
 		if _, err := destFile.Write(compressedData); err != nil {
@@ -276,14 +277,17 @@ func compressFile(src, dst string) error {
 
 	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Writing metadata...\n", totalChunks, totalChunks)
 
-	metadataBytes := encodeMetadata(allCompressionSteps)
+	// Write delimiter marker to separate data section from metadata section
+	delimiter := []byte("GOXORRO_META_START")
+	if _, err := destFile.Write(delimiter); err != nil {
+		return err
+	}
+
+	// Write metadata section
+	metadataBytes := encodeMetadataWithDelimiters(allCompressionSteps)
 	logDebug("Metadata encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
 
 	if _, err := destFile.Write(metadataBytes); err != nil {
-		return err
-	}
-	
-	if err := binary.Write(destFile, binary.LittleEndian, int32(len(metadataBytes))); err != nil {
 		return err
 	}
 
@@ -348,26 +352,32 @@ func decompressFile(src, dst string) error {
 	}
 	logDebug("Compressed file size: %d bytes", stat.Size())
 
-	var metadataSize int32
-	if _, err := sourceFile.Seek(-4, io.SeekEnd); err != nil {
+	// Find the metadata delimiter
+	delimiter := []byte("GOXORRO_META_START")
+	file_content, err := io.ReadAll(sourceFile)
+	if err != nil {
 		return err
 	}
-	if err := binary.Read(sourceFile, binary.LittleEndian, &metadataSize); err != nil {
-		return err
+	
+	// Find delimiter position
+	delimiterPos := -1
+	for i := 0; i <= len(file_content)-len(delimiter); i++ {
+		if string(file_content[i:i+len(delimiter)]) == string(delimiter) {
+			delimiterPos = i
+			break
+		}
 	}
-	logDebug("Metadata size: %d bytes", metadataSize)
+	
+	if delimiterPos == -1 {
+		return fmt.Errorf("metadata delimiter not found")
+	}
+	
+	// Extract metadata section
+	metadataStart := delimiterPos + len(delimiter)
+	metadataBytes := file_content[metadataStart:]
+	logDebug("Metadata starts at position %d, size: %d bytes", metadataStart, len(metadataBytes))
 
-	metadataStart := stat.Size() - int64(metadataSize) - 4
-	if _, err := sourceFile.Seek(metadataStart, io.SeekStart); err != nil {
-		return err
-	}
-
-	metadataBytes := make([]byte, metadataSize)
-	if _, err := io.ReadFull(sourceFile, metadataBytes); err != nil {
-		return err
-	}
-
-	allCompressionSteps, err := decodeMetadata(metadataBytes)
+	allCompressionSteps, err := decodeMetadataWithDelimiters(metadataBytes)
 	if err != nil {
 		return err
 	}
@@ -376,29 +386,33 @@ func decompressFile(src, dst string) error {
 
 	fmt.Printf("Decompressing %d chunks...\n", totalChunks)
 
-	if _, err := sourceFile.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
+	// Process data section (before delimiter)
+	dataSection := file_content[:delimiterPos]
+	logDebug("Data section size: %d bytes", len(dataSection))
+	
 	chunkIndex := 0
 	totalDecompressed := 0
 	var avgDecompTime time.Duration
+	dataOffset := 0
 	
-	for {
-		pos, _ := sourceFile.Seek(0, io.SeekCurrent)
-		if pos >= metadataStart {
+	for chunkIndex < totalChunks {
+		if dataOffset >= len(dataSection) {
 			break
 		}
 
-		var chunkSize int32
-		if err := binary.Read(sourceFile, binary.LittleEndian, &chunkSize); err != nil {
+		// Read chunk size (4 bytes, uint32 little endian)
+		if dataOffset+4 > len(dataSection) {
 			break
 		}
+		chunkSize := binary.LittleEndian.Uint32(dataSection[dataOffset:dataOffset+4])
+		dataOffset += 4
 
-		compressedData := make([]byte, chunkSize)
-		if _, err := sourceFile.Read(compressedData); err != nil {
-			return err
+		// Read compressed data
+		if dataOffset+int(chunkSize) > len(dataSection) {
+			return fmt.Errorf("chunk data extends beyond data section")
 		}
+		compressedData := dataSection[dataOffset:dataOffset+int(chunkSize)]
+		dataOffset += int(chunkSize)
 
 		if chunkIndex >= len(allCompressionSteps) {
 			return fmt.Errorf("chunk index out of range")
@@ -633,6 +647,48 @@ func bitsToBytes(bits []int) []byte {
 	return result
 }
 
+func encodeMetadataWithDelimiters(allSteps [][]CompressionStep) []byte {
+	var result []byte
+	
+	// Write number of chunks
+	result = append(result, byte(len(allSteps)))
+	
+	// Write metadata for each chunk with delimiters
+	for chunkIndex, steps := range allSteps {
+		if chunkIndex > 0 {
+			// Add delimiter between chunks
+			delimiter := []byte("CHUNK_SEP")
+			result = append(result, delimiter...)
+		}
+		
+		var negateApplied byte
+		var xorSteps []CompressionStep
+		
+		for _, step := range steps {
+			if step.Operation == "negate" && step.Applied {
+				negateApplied = 1
+			} else if step.Operation == "xor" && step.Applied {
+				xorSteps = append(xorSteps, step)
+			}
+		}
+		
+		result = append(result, negateApplied, byte(len(xorSteps)))
+		
+		var primeIndices []int
+		for _, step := range xorSteps {
+			primeIndex := getPrimeIndex(step.Prime)
+			if primeIndex >= 0 && primeIndex < len(primes) {
+				primeIndices = append(primeIndices, primeIndex)
+			}
+		}
+		
+		packedBits := pack11BitIndices(primeIndices)
+		result = append(result, packedBits...)
+	}
+	
+	return result
+}
+
 func encodeMetadata(allSteps [][]CompressionStep) []byte {
 	var result []byte
 	
@@ -665,6 +721,68 @@ func encodeMetadata(allSteps [][]CompressionStep) []byte {
 	}
 	
 	return result
+}
+
+func decodeMetadataWithDelimiters(data []byte) ([][]CompressionStep, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty metadata")
+	}
+	
+	numChunks := int(data[0])
+	var allSteps [][]CompressionStep
+	
+	offset := 1
+	delimiter := []byte("CHUNK_SEP")
+	
+	for i := 0; i < numChunks; i++ {
+		// Skip delimiter if not first chunk
+		if i > 0 {
+			if offset+len(delimiter) <= len(data) && 
+			   string(data[offset:offset+len(delimiter)]) == string(delimiter) {
+				offset += len(delimiter)
+			}
+		}
+		
+		if offset+1 >= len(data) {
+			return nil, fmt.Errorf("invalid metadata: insufficient data")
+		}
+		
+		negateApplied := data[offset]
+		numXorSteps := int(data[offset+1])
+		offset += 2
+		
+		var steps []CompressionStep
+		
+		if negateApplied == 1 {
+			steps = append(steps, CompressionStep{Operation: "negate", Applied: true})
+		}
+		
+		if numXorSteps > 0 {
+			packedBitsLength := (numXorSteps*11 + 7) / 8
+			if offset+packedBitsLength > len(data) {
+				return nil, fmt.Errorf("invalid metadata: insufficient XOR step data")
+			}
+			
+			packedBits := data[offset : offset+packedBitsLength]
+			primeIndices := unpack11BitIndices(packedBits, numXorSteps)
+			
+			for _, primeIndex := range primeIndices {
+				if primeIndex < len(primes) {
+					steps = append(steps, CompressionStep{
+						Operation: "xor",
+						Prime:     primes[primeIndex],
+						Applied:   true,
+					})
+				}
+			}
+			
+			offset += packedBitsLength
+		}
+		
+		allSteps = append(allSteps, steps)
+	}
+	
+	return allSteps, nil
 }
 
 func decodeMetadata(data []byte) ([][]CompressionStep, error) {
