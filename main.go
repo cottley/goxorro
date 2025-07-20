@@ -138,9 +138,11 @@ func getPrimeIndex(prime int) int {
 func main() {
 	var compressFlag bool
 	var decompressFlag bool
+	var primeLimit int
 	flag.BoolVar(&compressFlag, "c", false, "Compress source file to destination file")
 	flag.BoolVar(&decompressFlag, "d", false, "Decompress source file to destination file")
 	flag.BoolVar(&verboseMode, "v", false, "Enable verbose logging to debug.log")
+	flag.IntVar(&primeLimit, "primes", 50, "Number of primes to test per chunk (0 = test all available primes)")
 	flag.Parse()
 
 	if verboseMode {
@@ -175,14 +177,169 @@ func main() {
 		}
 		logDebug("Decompression completed successfully")
 	} else {
-		logDebug("Starting compression: %s -> %s", sourceFile, destFile)
-		if err := compressFile(sourceFile, destFile); err != nil {
+		logDebug("Starting compression: %s -> %s (testing %d primes per chunk)", sourceFile, destFile, primeLimit)
+		if primeLimit == 0 {
+			logDebug("Using all %d available primes", len(primes))
+		}
+		if err := compressFileWithPrimeLimit(sourceFile, destFile, primeLimit); err != nil {
 			logDebug("Compression failed: %v", err)
 			fmt.Fprintf(os.Stderr, "Error compressing file: %v\n", err)
 			os.Exit(1)
 		}
 		logDebug("Compression completed successfully")
 	}
+}
+
+func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	stat, err := sourceFile.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := stat.Size()
+	totalChunks := (fileSize + 1023) / 1024
+	logDebug("Source file size: %d bytes (%d chunks)", fileSize, totalChunks)
+
+	if primeLimit == 0 {
+		fmt.Printf("Compressing %d bytes in %d chunks (testing all %d primes)...\n", fileSize, totalChunks, len(primes))
+	} else {
+		fmt.Printf("Compressing %d bytes in %d chunks (testing %d primes per chunk)...\n", fileSize, totalChunks, primeLimit)
+	}
+
+	buffer := make([]byte, 1024)
+	var allCompressionSteps [][]CompressionStep
+	chunkCount := 0
+	bytesProcessed := int64(0)
+	var avgChunkTime time.Duration
+
+	for {
+		n, err := sourceFile.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		chunk := buffer[:n]
+		bytesProcessed += int64(n)
+		progress := float64(bytesProcessed) / float64(fileSize) * 100
+		
+		start := time.Now()
+		compressedData, steps := compressChunkWithPrimeLimit(chunk, primeLimit)
+		duration := time.Since(start)
+		
+		// Calculate time estimates
+		if chunkCount == 0 {
+			avgChunkTime = duration
+		} else {
+			// Moving average of chunk processing time
+			avgChunkTime = (avgChunkTime*time.Duration(chunkCount) + duration) / time.Duration(chunkCount+1)
+		}
+		
+		remainingChunks := int64(totalChunks) - int64(chunkCount + 1)
+		estimatedRemaining := avgChunkTime * time.Duration(remainingChunks)
+		
+		// Format time estimates
+		timeStr := ""
+		if chunkCount > 2 { // Show estimates after a few chunks for accuracy
+			if estimatedRemaining < time.Minute {
+				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
+			} else if estimatedRemaining < time.Hour {
+				timeStr = fmt.Sprintf(" ETA: %dm%ds", int(estimatedRemaining.Minutes()), int(estimatedRemaining.Seconds())%60)
+			} else {
+				timeStr = fmt.Sprintf(" ETA: %dh%dm", int(estimatedRemaining.Hours()), int(estimatedRemaining.Minutes())%60)
+			}
+		}
+		
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkCount+1, totalChunks, timeStr)
+		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
+		
+		logDebug("Chunk %d compressed: %d -> %d bytes (%.3f ratio) in %v", 
+			chunkCount, len(chunk), len(compressedData), 
+			float64(len(compressedData))/float64(len(chunk)), duration)
+		logDebug("Chunk %d compression steps: %d operations", chunkCount, len(steps))
+		
+		allCompressionSteps = append(allCompressionSteps, steps)
+
+		// Write compressed data with length delimiter
+		if err := binary.Write(destFile, binary.LittleEndian, uint32(len(compressedData))); err != nil {
+			return err
+		}
+		if _, err := destFile.Write(compressedData); err != nil {
+			return err
+		}
+		
+		chunkCount++
+	}
+
+	fmt.Printf("\rProgress: 100.0%% (%d/%d chunks) - Writing metadata...\n", totalChunks, totalChunks)
+
+	// Write delimiter marker to separate data section from metadata section
+	delimiter := []byte("GOXORRO_META_START")
+	if _, err := destFile.Write(delimiter); err != nil {
+		return err
+	}
+
+	// Write metadata section
+	metadataBytes := encodeMetadataWithDelimiters(allCompressionSteps)
+	logDebug("Metadata encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
+
+	if _, err := destFile.Write(metadataBytes); err != nil {
+		return err
+	}
+
+	// Close the raw XOR file
+	destFile.Close()
+	
+	// Get raw file size
+	rawStat, err := os.Stat(dst)
+	if err != nil {
+		return err
+	}
+	rawSize := rawStat.Size()
+	logDebug("Raw XOR file size: %d bytes", rawSize)
+	fmt.Printf("XOR processing complete: %d -> %d bytes\n", fileSize, rawSize)
+	
+	// Now gzip the entire file
+	fmt.Printf("Applying gzip compression to entire file...\n")
+	gzipDst := dst + ".gz"
+	if err := gzipEntireFile(dst, gzipDst); err != nil {
+		return err
+	}
+	
+	// Get final gzipped size
+	gzipStat, err := os.Stat(gzipDst)
+	if err != nil {
+		return err
+	}
+	finalSize := gzipStat.Size()
+	logDebug("Final gzipped file size: %d bytes", finalSize)
+	
+	fmt.Printf("Final compression: %d -> %d bytes (%.1f%% reduction)\n", 
+		fileSize, finalSize, (1.0-float64(finalSize)/float64(fileSize))*100)
+	fmt.Printf("Gzip improvement: %d -> %d bytes (%.1f%% reduction)\n", 
+		rawSize, finalSize, (1.0-float64(finalSize)/float64(rawSize))*100)
+	
+	// Compare to original (for JPEG testing)
+	if fileSize > finalSize {
+		fmt.Printf("SUCCESS: Compressed file is smaller than original!\n")
+	} else {
+		fmt.Printf("Original file was already more compact.\n")
+	}
+
+	return nil
 }
 
 func compressFile(src, dst string) error {
@@ -461,6 +618,89 @@ func decompressFile(src, dst string) error {
 
 	logDebug("Decompression complete: %d chunks, %d total bytes", chunkIndex, totalDecompressed)
 	return nil
+}
+
+func compressChunkWithPrimeLimit(data []byte, primeLimit int) ([]byte, []CompressionStep) {
+	var steps []CompressionStep
+	bitStream := bytesToBits(data)
+	
+	ones, zeros := countBits(bitStream)
+	logDebug("Initial bit distribution: %d ones, %d zeros (%.1f%% ones)", 
+		ones, zeros, float64(ones)/float64(len(bitStream))*100)
+	
+	if ones > zeros {
+		bitStream = negateBits(bitStream)
+		steps = append(steps, CompressionStep{Operation: "negate", Applied: true})
+		logDebug("Applied negation: %d zeros, %d ones", ones, zeros)
+	}
+
+	
+	// Continue XOR operations until no improvement is possible (limit iterations for performance)
+	maxIterations := 10
+	if len(bitStream) >= 8192 { // 1KB chunks - optimize for JPEG testing
+		maxIterations = 5
+	}
+	
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		logDebug("XOR iteration %d: testing primes for bit stream with %d bits", 
+			iteration, len(bitStream))
+		
+		bestPrime := -1
+		bestZeros := 0
+		var bestResult []int
+		primesChecked := 0
+		currentZeros := countZeros(bitStream)
+		
+		// Use the prime limit parameter
+		maxPrimesToTest := primeLimit
+		if primeLimit == 0 {
+			// Test all available primes
+			maxPrimesToTest = len(primes)
+		} else if len(bitStream) < 2048 { // Small chunks can use more primes if limit allows
+			if primeLimit > 200 {
+				maxPrimesToTest = 200
+			}
+		}
+		
+		logDebug("Testing up to %d primes for iteration %d", maxPrimesToTest, iteration)
+		
+		for i, prime := range primes {
+			if i >= maxPrimesToTest {
+				break
+			}
+			
+			xorPattern := createXORPattern(len(bitStream), prime)
+			testResult := xorBits(bitStream, xorPattern)
+			
+			zeros := countZeros(testResult)
+			primesChecked++
+			
+			// Only accept if we get MORE zeros than current (strict improvement)
+			if zeros > currentZeros && zeros > bestZeros {
+				bestZeros = zeros
+				bestPrime = prime
+				bestResult = testResult
+				logDebug("New best prime %d: %d zeros (%.1f%% improvement)", 
+					prime, zeros, float64(zeros-currentZeros)/float64(len(bitStream))*100)
+			}
+		}
+		
+		logDebug("Iteration %d complete: checked %d primes, best improvement: %d -> %d zeros", 
+			iteration, primesChecked, currentZeros, bestZeros)
+		
+		// Stop if no improvement found (no prime increases zeros)
+		if bestPrime == -1 {
+			logDebug("No further improvement possible, stopping XOR iterations")
+			break
+		}
+		
+		bitStream = bestResult
+		steps = append(steps, CompressionStep{Operation: "xor", Prime: bestPrime, Applied: true})
+	}
+
+	// Return raw bit stream as bytes (no gzip compression)
+	compressed := bitsToBytes(bitStream)
+	return compressed, steps
 }
 
 func compressChunk(data []byte) ([]byte, []CompressionStep) {
