@@ -1,7 +1,8 @@
 package main
 
 import (
-	"container/heap"
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -55,41 +56,6 @@ func isPrime(n int) bool {
 	return true
 }
 
-type HuffmanNode struct {
-	Value     int
-	Frequency int
-	Left      *HuffmanNode
-	Right     *HuffmanNode
-}
-
-type HuffmanTree struct {
-	Root  *HuffmanNode
-	Codes map[int]string
-}
-
-type PriorityQueue []*HuffmanNode
-
-func (pq PriorityQueue) Len() int { return len(pq) }
-
-func (pq PriorityQueue) Less(i, j int) bool {
-	return pq[i].Frequency < pq[j].Frequency
-}
-
-func (pq PriorityQueue) Swap(i, j int) {
-	pq[i], pq[j] = pq[j], pq[i]
-}
-
-func (pq *PriorityQueue) Push(x interface{}) {
-	*pq = append(*pq, x.(*HuffmanNode))
-}
-
-func (pq *PriorityQueue) Pop() interface{} {
-	old := *pq
-	n := len(old)
-	item := old[n-1]
-	*pq = old[0 : n-1]
-	return item
-}
 
 func getPrimeIndex(prime int) int {
 	for i, p := range primes {
@@ -320,7 +286,7 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 		}
 	}
 
-	compressed := huffmanEncode(bitStream)
+	compressed := gzipCompress(bitStream)
 	return compressed, steps
 }
 
@@ -374,86 +340,9 @@ func isSparseBitStream(bits []int) bool {
 	return float64(ones)/float64(len(bits)) < 0.1
 }
 
-func huffmanEncode(bits []int) []byte {
-	if len(bits) == 0 {
-		return []byte{}
-	}
-	
-	frequency := make(map[int]int)
-	for _, bit := range bits {
-		frequency[bit]++
-	}
-	
-	if len(frequency) == 1 {
-		var value int
-		for k := range frequency {
-			value = k
-		}
-		result := make([]byte, 5)
-		result[0] = 1
-		result[1] = byte(value)
-		binary.LittleEndian.PutUint16(result[2:4], uint16(len(bits)))
-		return result
-	}
-	
-	tree := buildHuffmanTree(frequency)
-	encodedBits := encodeWithTree(bits, tree)
-	
-	var result []byte
-	result = append(result, 0)
-	
-	treeBytes := serializeTree(tree)
-	result = append(result, byte(len(treeBytes)))
-	result = append(result, treeBytes...)
-	
-	lengthBytes := make([]byte, 2)
-	binary.LittleEndian.PutUint16(lengthBytes, uint16(len(bits)))
-	result = append(result, lengthBytes...)
-	
-	paddedBits := padBits(encodedBits)
-	result = append(result, bitsToBytes(paddedBits)...)
-	
-	return result
-}
-
-func huffmanDecode(data []byte) []int {
-	if len(data) == 0 {
-		return []int{}
-	}
-	
-	if data[0] == 1 {
-		if len(data) < 5 {
-			return []int{}
-		}
-		value := int(data[1])
-		length := int(binary.LittleEndian.Uint16(data[2:4]))
-		result := make([]int, length)
-		for i := range result {
-			result[i] = value
-		}
-		return result
-	}
-	
-	if len(data) < 4 {
-		return []int{}
-	}
-	
-	treeSize := int(data[1])
-	if len(data) < 4+treeSize {
-		return []int{}
-	}
-	
-	tree := deserializeTree(data[2 : 2+treeSize])
-	originalLength := int(binary.LittleEndian.Uint16(data[2+treeSize : 4+treeSize]))
-	
-	encodedBytes := data[4+treeSize:]
-	encodedBits := bytesToBits(encodedBytes)
-	
-	return decodeWithTree(encodedBits, tree, originalLength)
-}
 
 func decompressChunk(compressedData []byte, steps []CompressionStep) []byte {
-	bitStream := huffmanDecode(compressedData)
+	bitStream := gzipDecompress(compressedData)
 	
 	for i := len(steps) - 1; i >= 0; i-- {
 		step := steps[i]
@@ -566,155 +455,45 @@ func decodeMetadata(data []byte) ([][]CompressionStep, error) {
 	return allSteps, nil
 }
 
-func buildHuffmanTree(frequency map[int]int) *HuffmanTree {
-	pq := make(PriorityQueue, 0)
-	heap.Init(&pq)
+
+func gzipCompress(bits []int) []byte {
+	bitBytes := bitsToBytes(bits)
 	
-	for value, freq := range frequency {
-		heap.Push(&pq, &HuffmanNode{
-			Value:     value,
-			Frequency: freq,
-		})
-	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
 	
-	for pq.Len() > 1 {
-		left := heap.Pop(&pq).(*HuffmanNode)
-		right := heap.Pop(&pq).(*HuffmanNode)
-		
-		merged := &HuffmanNode{
-			Value:     -1,
-			Frequency: left.Frequency + right.Frequency,
-			Left:      left,
-			Right:     right,
-		}
-		
-		heap.Push(&pq, merged)
-	}
+	lengthBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lengthBytes, uint32(len(bits)))
+	gz.Write(lengthBytes)
+	gz.Write(bitBytes)
+	gz.Close()
 	
-	root := heap.Pop(&pq).(*HuffmanNode)
-	codes := make(map[int]string)
-	generateCodes(root, "", codes)
-	
-	return &HuffmanTree{
-		Root:  root,
-		Codes: codes,
-	}
+	return buf.Bytes()
 }
 
-func generateCodes(node *HuffmanNode, code string, codes map[int]string) {
-	if node == nil {
-		return
+func gzipDecompress(data []byte) []int {
+	buf := bytes.NewReader(data)
+	gz, err := gzip.NewReader(buf)
+	if err != nil {
+		return []int{}
+	}
+	defer gz.Close()
+	
+	lengthBytes := make([]byte, 4)
+	if _, err := io.ReadFull(gz, lengthBytes); err != nil {
+		return []int{}
+	}
+	originalBitLength := int(binary.LittleEndian.Uint32(lengthBytes))
+	
+	compressedBytes, err := io.ReadAll(gz)
+	if err != nil {
+		return []int{}
 	}
 	
-	if node.Left == nil && node.Right == nil {
-		if code == "" {
-			code = "0"
-		}
-		codes[node.Value] = code
-		return
+	allBits := bytesToBits(compressedBytes)
+	if len(allBits) >= originalBitLength {
+		return allBits[:originalBitLength]
 	}
 	
-	generateCodes(node.Left, code+"0", codes)
-	generateCodes(node.Right, code+"1", codes)
-}
-
-func encodeWithTree(bits []int, tree *HuffmanTree) []int {
-	var result []int
-	
-	for _, bit := range bits {
-		code := tree.Codes[bit]
-		for _, c := range code {
-			if c == '0' {
-				result = append(result, 0)
-			} else {
-				result = append(result, 1)
-			}
-		}
-	}
-	
-	return result
-}
-
-func decodeWithTree(encodedBits []int, tree *HuffmanTree, originalLength int) []int {
-	var result []int
-	current := tree.Root
-	
-	for i := 0; i < len(encodedBits) && len(result) < originalLength; i++ {
-		if encodedBits[i] == 0 {
-			current = current.Left
-		} else {
-			current = current.Right
-		}
-		
-		if current.Left == nil && current.Right == nil {
-			result = append(result, current.Value)
-			current = tree.Root
-		}
-	}
-	
-	return result
-}
-
-func serializeTree(tree *HuffmanTree) []byte {
-	var result []byte
-	serializeNode(tree.Root, &result)
-	return result
-}
-
-func serializeNode(node *HuffmanNode, result *[]byte) {
-	if node == nil {
-		return
-	}
-	
-	if node.Left == nil && node.Right == nil {
-		*result = append(*result, 1)
-		*result = append(*result, byte(node.Value))
-	} else {
-		*result = append(*result, 0)
-		serializeNode(node.Left, result)
-		serializeNode(node.Right, result)
-	}
-}
-
-func deserializeTree(data []byte) *HuffmanTree {
-	var index int
-	root := deserializeNode(data, &index)
-	codes := make(map[int]string)
-	generateCodes(root, "", codes)
-	return &HuffmanTree{
-		Root:  root,
-		Codes: codes,
-	}
-}
-
-func deserializeNode(data []byte, index *int) *HuffmanNode {
-	if *index >= len(data) {
-		return nil
-	}
-	
-	if data[*index] == 1 {
-		*index++
-		if *index >= len(data) {
-			return nil
-		}
-		value := int(data[*index])
-		*index++
-		return &HuffmanNode{Value: value}
-	} else {
-		*index++
-		left := deserializeNode(data, index)
-		right := deserializeNode(data, index)
-		return &HuffmanNode{
-			Value: -1,
-			Left:  left,
-			Right: right,
-		}
-	}
-}
-
-func padBits(bits []int) []int {
-	padding := (8 - len(bits)%8) % 8
-	result := make([]int, len(bits)+padding)
-	copy(result, bits)
-	return result
+	return allBits
 }
