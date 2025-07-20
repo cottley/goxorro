@@ -212,6 +212,7 @@ func compressFile(src, dst string) error {
 	var allCompressionSteps [][]CompressionStep
 	chunkCount := 0
 	bytesProcessed := int64(0)
+	var avgChunkTime time.Duration
 
 	for {
 		n, err := sourceFile.Read(buffer)
@@ -226,12 +227,35 @@ func compressFile(src, dst string) error {
 		bytesProcessed += int64(n)
 		progress := float64(bytesProcessed) / float64(fileSize) * 100
 		
-		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", progress, chunkCount+1, totalChunks)
-		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
-		
 		start := time.Now()
 		compressedData, steps := compressChunk(chunk)
 		duration := time.Since(start)
+		
+		// Calculate time estimates
+		if chunkCount == 0 {
+			avgChunkTime = duration
+		} else {
+			// Moving average of chunk processing time
+			avgChunkTime = (avgChunkTime*time.Duration(chunkCount) + duration) / time.Duration(chunkCount+1)
+		}
+		
+		remainingChunks := int64(totalChunks) - int64(chunkCount + 1)
+		estimatedRemaining := avgChunkTime * time.Duration(remainingChunks)
+		
+		// Format time estimates
+		timeStr := ""
+		if chunkCount > 2 { // Show estimates after a few chunks for accuracy
+			if estimatedRemaining < time.Minute {
+				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
+			} else if estimatedRemaining < time.Hour {
+				timeStr = fmt.Sprintf(" ETA: %dm%ds", int(estimatedRemaining.Minutes()), int(estimatedRemaining.Seconds())%60)
+			} else {
+				timeStr = fmt.Sprintf(" ETA: %dh%dm", int(estimatedRemaining.Hours()), int(estimatedRemaining.Minutes())%60)
+			}
+		}
+		
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkCount+1, totalChunks, timeStr)
+		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
 		
 		logDebug("Chunk %d compressed: %d -> %d bytes (%.3f ratio) in %v", 
 			chunkCount, len(chunk), len(compressedData), 
@@ -358,6 +382,8 @@ func decompressFile(src, dst string) error {
 
 	chunkIndex := 0
 	totalDecompressed := 0
+	var avgDecompTime time.Duration
+	
 	for {
 		pos, _ := sourceFile.Seek(0, io.SeekCurrent)
 		if pos >= metadataStart {
@@ -378,13 +404,33 @@ func decompressFile(src, dst string) error {
 			return fmt.Errorf("chunk index out of range")
 		}
 
-		progress := float64(chunkIndex+1) / float64(totalChunks) * 100
-		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)", progress, chunkIndex+1, totalChunks)
-		
 		logDebug("Decompressing chunk %d: %d bytes compressed", chunkIndex, chunkSize)
 		start := time.Now()
 		originalData := decompressChunk(compressedData, allCompressionSteps[chunkIndex])
 		duration := time.Since(start)
+		
+		// Calculate decompression time estimates
+		if chunkIndex == 0 {
+			avgDecompTime = duration
+		} else {
+			avgDecompTime = (avgDecompTime*time.Duration(chunkIndex) + duration) / time.Duration(chunkIndex+1)
+		}
+		
+		remainingChunks := totalChunks - (chunkIndex + 1)
+		estimatedRemaining := avgDecompTime * time.Duration(remainingChunks)
+		progress := float64(chunkIndex+1) / float64(totalChunks) * 100
+		
+		// Format time estimates for decompression
+		timeStr := ""
+		if chunkIndex > 1 && remainingChunks > 0 {
+			if estimatedRemaining < time.Minute {
+				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
+			} else {
+				timeStr = fmt.Sprintf(" ETA: %dm%ds", int(estimatedRemaining.Minutes()), int(estimatedRemaining.Seconds())%60)
+			}
+		}
+		
+		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkIndex+1, totalChunks, timeStr)
 		
 		logDebug("Chunk %d decompressed: %d -> %d bytes in %v", 
 			chunkIndex, chunkSize, len(originalData), duration)
