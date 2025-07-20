@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +12,17 @@ type CompressionStep struct {
 	Operation string
 	Prime     int
 	Applied   bool
+}
+
+var primes = []int{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
+
+func getPrimeIndex(prime int) int {
+	for i, p := range primes {
+		if p == prime {
+			return i
+		}
+	}
+	return -1
 }
 
 func main() {
@@ -93,16 +103,13 @@ func compressFile(src, dst string) error {
 		}
 	}
 
-	stepsJSON, err := json.Marshal(allCompressionSteps)
-	if err != nil {
-		return err
-	}
+	metadataBytes := encodeMetadata(allCompressionSteps)
 
-	if _, err := destFile.Write(stepsJSON); err != nil {
+	if _, err := destFile.Write(metadataBytes); err != nil {
 		return err
 	}
 	
-	if err := binary.Write(destFile, binary.LittleEndian, int32(len(stepsJSON))); err != nil {
+	if err := binary.Write(destFile, binary.LittleEndian, int32(len(metadataBytes))); err != nil {
 		return err
 	}
 
@@ -145,8 +152,8 @@ func decompressFile(src, dst string) error {
 		return err
 	}
 
-	var allCompressionSteps [][]CompressionStep
-	if err := json.Unmarshal(metadataBytes, &allCompressionSteps); err != nil {
+	allCompressionSteps, err := decodeMetadata(metadataBytes)
+	if err != nil {
 		return err
 	}
 
@@ -196,7 +203,6 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 		steps = append(steps, CompressionStep{Operation: "negate", Applied: true})
 	}
 
-	primes := []int{2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}
 	
 	for _, prime := range primes {
 		xorPattern := createXORPattern(len(bitStream), prime)
@@ -342,4 +348,80 @@ func bitsToBytes(bits []int) []byte {
 	}
 	
 	return result
+}
+
+func encodeMetadata(allSteps [][]CompressionStep) []byte {
+	var result []byte
+	
+	result = append(result, byte(len(allSteps)))
+	
+	for _, steps := range allSteps {
+		var negateApplied byte
+		var xorSteps []CompressionStep
+		
+		for _, step := range steps {
+			if step.Operation == "negate" && step.Applied {
+				negateApplied = 1
+			} else if step.Operation == "xor" && step.Applied {
+				xorSteps = append(xorSteps, step)
+			}
+		}
+		
+		result = append(result, negateApplied, byte(len(xorSteps)))
+		
+		for _, step := range xorSteps {
+			primeIndex := getPrimeIndex(step.Prime)
+			if primeIndex >= 0 && primeIndex < 11 {
+				result = append(result, byte(primeIndex))
+			}
+		}
+	}
+	
+	return result
+}
+
+func decodeMetadata(data []byte) ([][]CompressionStep, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty metadata")
+	}
+	
+	numChunks := int(data[0])
+	var allSteps [][]CompressionStep
+	
+	offset := 1
+	for i := 0; i < numChunks; i++ {
+		if offset+1 >= len(data) {
+			return nil, fmt.Errorf("invalid metadata: insufficient data")
+		}
+		
+		negateApplied := data[offset]
+		numXorSteps := int(data[offset+1])
+		offset += 2
+		
+		if offset+numXorSteps > len(data) {
+			return nil, fmt.Errorf("invalid metadata: insufficient XOR step data")
+		}
+		
+		var steps []CompressionStep
+		
+		if negateApplied == 1 {
+			steps = append(steps, CompressionStep{Operation: "negate", Applied: true})
+		}
+		
+		for j := 0; j < numXorSteps; j++ {
+			primeIndex := int(data[offset+j])
+			if primeIndex < len(primes) {
+				steps = append(steps, CompressionStep{
+					Operation: "xor",
+					Prime:     primes[primeIndex],
+					Applied:   true,
+				})
+			}
+		}
+		
+		offset += numXorSteps
+		allSteps = append(allSteps, steps)
+	}
+	
+	return allSteps, nil
 }
