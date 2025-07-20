@@ -4,7 +4,7 @@ A simple Go command line application for compressing files.
 
 ## Features
 
-- Copy files from source to destination
+- Compress file from source to destination
 - Check if source file exists before copying
 - Simple command line interface with `-c` flag
 - Self-contained binary build
