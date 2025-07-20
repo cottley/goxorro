@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"encoding/binary"
 	"flag"
@@ -264,12 +263,43 @@ func compressFile(src, dst string) error {
 		return err
 	}
 
-	finalStat, err := destFile.Stat()
-	if err == nil {
-		logDebug("Final compressed file size: %d bytes", finalStat.Size())
-		fmt.Printf("Compression complete: %d -> %d bytes (%.1f%% reduction)\n", 
-			fileSize, finalStat.Size(), 
-			(1.0-float64(finalStat.Size())/float64(fileSize))*100)
+	// Close the raw XOR file
+	destFile.Close()
+	
+	// Get raw file size
+	rawStat, err := os.Stat(dst)
+	if err != nil {
+		return err
+	}
+	rawSize := rawStat.Size()
+	logDebug("Raw XOR file size: %d bytes", rawSize)
+	fmt.Printf("XOR processing complete: %d -> %d bytes\n", fileSize, rawSize)
+	
+	// Now gzip the entire file
+	fmt.Printf("Applying gzip compression to entire file...\n")
+	gzipDst := dst + ".gz"
+	if err := gzipEntireFile(dst, gzipDst); err != nil {
+		return err
+	}
+	
+	// Get final gzipped size
+	gzipStat, err := os.Stat(gzipDst)
+	if err != nil {
+		return err
+	}
+	finalSize := gzipStat.Size()
+	logDebug("Final gzipped file size: %d bytes", finalSize)
+	
+	fmt.Printf("Final compression: %d -> %d bytes (%.1f%% reduction)\n", 
+		fileSize, finalSize, (1.0-float64(finalSize)/float64(fileSize))*100)
+	fmt.Printf("Gzip improvement: %d -> %d bytes (%.1f%% reduction)\n", 
+		rawSize, finalSize, (1.0-float64(finalSize)/float64(rawSize))*100)
+	
+	// Compare to original (for JPEG testing)
+	if fileSize > finalSize {
+		fmt.Printf("SUCCESS: Compressed file is smaller than original!\n")
+	} else {
+		fmt.Printf("Original file was already more compact.\n")
 	}
 
 	return nil
@@ -388,7 +418,13 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 	}
 
 	
-	for iteration := 0; iteration < 10; iteration++ {
+	// Continue XOR operations until no improvement is possible (limit iterations for performance)
+	maxIterations := 10
+	if len(bitStream) >= 8192 { // 1KB chunks - optimize for JPEG testing
+		maxIterations = 5
+	}
+	
+	for iteration := 0; iteration < maxIterations; iteration++ {
 		logDebug("XOR iteration %d: testing primes for bit stream with %d bits", 
 			iteration, len(bitStream))
 		
@@ -396,55 +432,50 @@ func compressChunk(data []byte) ([]byte, []CompressionStep) {
 		bestZeros := 0
 		var bestResult []int
 		primesChecked := 0
+		currentZeros := countZeros(bitStream)
+		
+		// For performance, test much fewer primes for large files
+		maxPrimesToTest := 50
+		if len(bitStream) < 2048 { // Small chunks get more prime testing
+			maxPrimesToTest = 200
+		}
 		
 		for i, prime := range primes {
-			if prime > 1000 && iteration == 0 {
-				continue
+			if i >= maxPrimesToTest {
+				break
 			}
 			
 			xorPattern := createXORPattern(len(bitStream), prime)
 			testResult := xorBits(bitStream, xorPattern)
 			
-			_, zeros := countBits(testResult)
+			zeros := countZeros(testResult)
 			primesChecked++
 			
-			if zeros > bestZeros {
+			// Only accept if we get MORE zeros than current (strict improvement)
+			if zeros > currentZeros && zeros > bestZeros {
 				bestZeros = zeros
 				bestPrime = prime
 				bestResult = testResult
-				logDebug("New best prime %d: %d zeros (%.1f%%)", 
-					prime, zeros, float64(zeros)/float64(len(bitStream))*100)
-				
-				if zeros > len(bitStream)*95/100 {
-					logDebug("Excellent pattern found (>95%% zeros), stopping early")
-					break
-				}
-			}
-			
-			if i > 100 && bestZeros > len(bitStream)*60/100 {
-				logDebug("Good pattern found after 100 primes (>60%% zeros), stopping")
-				break
+				logDebug("New best prime %d: %d zeros (%.1f%% improvement)", 
+					prime, zeros, float64(zeros-currentZeros)/float64(len(bitStream))*100)
 			}
 		}
 		
-		logDebug("Iteration %d complete: checked %d primes, best was %d with %d zeros", 
-			iteration, primesChecked, bestPrime, bestZeros)
+		logDebug("Iteration %d complete: checked %d primes, best improvement: %d -> %d zeros", 
+			iteration, primesChecked, currentZeros, bestZeros)
 		
-		if bestPrime == -1 || bestZeros <= len(bitStream)/2 {
-			logDebug("No improvement found, stopping iterations")
+		// Stop if no improvement found (no prime increases zeros)
+		if bestPrime == -1 {
+			logDebug("No further improvement possible, stopping XOR iterations")
 			break
 		}
 		
 		bitStream = bestResult
 		steps = append(steps, CompressionStep{Operation: "xor", Prime: bestPrime, Applied: true})
-		
-		if isSparseBitStream(bitStream) {
-			logDebug("Bit stream is now sparse (<5%% ones), stopping")
-			break
-		}
 	}
 
-	compressed := gzipCompress(bitStream)
+	// Return raw bit stream as bytes (no gzip compression)
+	compressed := bitsToBytes(bitStream)
 	return compressed, steps
 }
 
@@ -479,6 +510,16 @@ func countOnes(bits []int) int {
 	return ones
 }
 
+func countZeros(bits []int) int {
+	zeros := 0
+	for _, bit := range bits {
+		if bit == 0 {
+			zeros++
+		}
+	}
+	return zeros
+}
+
 func negateBits(bits []int) []int {
 	result := make([]int, len(bits))
 	for i, bit := range bits {
@@ -510,7 +551,8 @@ func isSparseBitStream(bits []int) bool {
 
 
 func decompressChunk(compressedData []byte, steps []CompressionStep) []byte {
-	bitStream := gzipDecompress(compressedData)
+	// Convert raw bytes back to bit stream (no gzip decompression)
+	bitStream := bytesToBits(compressedData)
 	
 	for i := len(steps) - 1; i >= 0; i-- {
 		step := steps[i]
@@ -631,6 +673,30 @@ func decodeMetadata(data []byte) ([][]CompressionStep, error) {
 	return allSteps, nil
 }
 
+func gzipEntireFile(srcPath, dstPath string) error {
+	// Open source file
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	
+	// Create destination file
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+	
+	// Create gzip writer
+	gzWriter := gzip.NewWriter(dstFile)
+	defer gzWriter.Close()
+	
+	// Copy and compress
+	_, err = io.Copy(gzWriter, srcFile)
+	return err
+}
+
 func pack11BitIndices(indices []int) []byte {
 	if len(indices) == 0 {
 		return []byte{}
@@ -683,47 +749,6 @@ func unpack11BitIndices(packedBits []byte, count int) []int {
 	return result
 }
 
-func gzipCompress(bits []int) []byte {
-	bitBytes := bitsToBytes(bits)
-	
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	
-	lengthBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lengthBytes, uint32(len(bits)))
-	gz.Write(lengthBytes)
-	gz.Write(bitBytes)
-	gz.Close()
-	
-	return buf.Bytes()
-}
-
-func gzipDecompress(data []byte) []int {
-	buf := bytes.NewReader(data)
-	gz, err := gzip.NewReader(buf)
-	if err != nil {
-		return []int{}
-	}
-	defer gz.Close()
-	
-	lengthBytes := make([]byte, 4)
-	if _, err := io.ReadFull(gz, lengthBytes); err != nil {
-		return []int{}
-	}
-	originalBitLength := int(binary.LittleEndian.Uint32(lengthBytes))
-	
-	compressedBytes, err := io.ReadAll(gz)
-	if err != nil {
-		return []int{}
-	}
-	
-	allBits := bytesToBits(compressedBytes)
-	if len(allBits) >= originalBitLength {
-		return allBits[:originalBitLength]
-	}
-	
-	return allBits
-}
 
 func initDebugLogging() {
 	logFile, err := os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
