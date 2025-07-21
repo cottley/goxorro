@@ -135,6 +135,130 @@ func getPrimeIndex(prime int) int {
 	return -1
 }
 
+// Permutation compression functions
+func countOneBits(data []byte) int {
+	count := 0
+	for _, b := range data {
+		for i := 0; i < 8; i++ {
+			if (b >> i) & 1 == 1 {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func generateInitialBitPattern(totalBits, oneBits int) []byte {
+	// Create bit pattern with all 1s on the right
+	result := make([]byte, (totalBits+7)/8)
+	
+	// Set the rightmost oneBits to 1
+	bitPos := totalBits - oneBits
+	for i := 0; i < oneBits; i++ {
+		byteIndex := (bitPos + i) / 8
+		bitIndex := (bitPos + i) % 8
+		result[byteIndex] |= 1 << (7 - bitIndex)
+	}
+	
+	return result
+}
+
+func performSwap(data []byte, totalBits int, swapNum uint64) {
+	// Convert bytes to bit array for easier manipulation
+	bits := make([]bool, totalBits)
+	for i := 0; i < totalBits; i++ {
+		byteIndex := i / 8
+		bitIndex := i % 8
+		bits[i] = (data[byteIndex] >> (7 - bitIndex)) & 1 == 1
+	}
+	
+	// Find all 0 and 1 positions
+	var zeroPositions []int
+	var onePositions []int
+	
+	for i := 0; i < totalBits; i++ {
+		if bits[i] {
+			onePositions = append(onePositions, i)
+		} else {
+			zeroPositions = append(zeroPositions, i)
+		}
+	}
+	
+	// Calculate which 0 and 1 to swap based on swapNum
+	// We can represent swapNum as choosing pairs (0_index, 1_index)
+	if len(zeroPositions) > 0 && len(onePositions) > 0 {
+		zeroIdx := int(swapNum % uint64(len(zeroPositions)))
+		oneIdx := int((swapNum / uint64(len(zeroPositions))) % uint64(len(onePositions)))
+		
+		// Swap the bits
+		zeroPos := zeroPositions[zeroIdx]
+		onePos := onePositions[oneIdx]
+		bits[zeroPos] = true
+		bits[onePos] = false
+	}
+	
+	// Convert back to bytes
+	for i := 0; i < len(data); i++ {
+		data[i] = 0
+	}
+	for i := 0; i < totalBits; i++ {
+		if bits[i] {
+			byteIndex := i / 8
+			bitIndex := i % 8
+			data[byteIndex] |= 1 << (7 - bitIndex)
+		}
+	}
+}
+
+func findSwapNumber(target []byte, oneBits int) uint64 {
+	totalBits := len(target) * 8
+	initial := generateInitialBitPattern(totalBits, oneBits)
+	
+	// Calculate max possible swaps: zeros * ones
+	zeros := totalBits - oneBits
+	maxSwaps := uint64(zeros * oneBits)
+	
+	fmt.Printf("DEBUG: Searching among %d possible swaps...\n", maxSwaps)
+	
+	for swapNum := uint64(0); swapNum < maxSwaps; swapNum++ {
+		current := make([]byte, len(initial))
+		copy(current, initial)
+		
+		performSwap(current, totalBits, swapNum)
+		
+		if bytesEqual(current, target) {
+			fmt.Printf("DEBUG: Found match at swap %d\n", swapNum)
+			return swapNum
+		}
+		
+		// Progress reporting
+		if swapNum % 10000 == 0 && swapNum > 0 {
+			fmt.Printf("DEBUG: Tested swap %d of %d...\n", swapNum, maxSwaps)
+		}
+	}
+	
+	fmt.Printf("DEBUG: No exact match found, returning 0\n")
+	return 0
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func recreateFromSwap(totalBits, oneBits int, swapNum uint64) []byte {
+	current := generateInitialBitPattern(totalBits, oneBits)
+	performSwap(current, totalBits, swapNum)
+	return current
+}
+
 func main() {
 	var compressFlag bool
 	var decompressFlag bool
@@ -219,7 +343,10 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 
 	buffer := make([]byte, 1024)
 	var allCompressionSteps [][]CompressionStep
-	var allSparseData [][]byte
+	var allPermutationData []struct {
+		OneBits         int
+		PermutationNum  uint64
+	}
 	chunkCount := 0
 	bytesProcessed := int64(0)
 	var avgChunkTime time.Duration
@@ -273,7 +400,29 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 		logDebug("Chunk %d compression steps: %d operations", chunkCount, len(steps))
 		
 		allCompressionSteps = append(allCompressionSteps, steps)
-		allSparseData = append(allSparseData, compressedData)
+		
+		// Count 1 bits in compressed data and find permutation number
+		oneBits := countOneBits(compressedData)
+		
+		// Pad to 1024 bytes for permutation calculation
+		paddedData := make([]byte, 1024)
+		copy(paddedData, compressedData)
+		
+		fmt.Printf("DEBUG: Chunk %d has %d bytes, %d one bits\n", chunkCount, len(compressedData), oneBits)
+		if len(compressedData) >= 4 {
+			fmt.Printf("DEBUG: First few bytes: %02x %02x %02x %02x\n", compressedData[0], compressedData[1], compressedData[2], compressedData[3])
+		} else {
+			fmt.Printf("DEBUG: All bytes: %02x\n", compressedData)
+		}
+		
+		swapNum := findSwapNumber(paddedData, oneBits)
+		fmt.Printf("DEBUG: Found swap number: %d\n", swapNum)
+		logDebug("Chunk %d: %d one bits, swap %d", chunkCount, oneBits, swapNum)
+		
+		allPermutationData = append(allPermutationData, struct {
+			OneBits         int
+			PermutationNum  uint64
+		}{oneBits, swapNum})
 		
 		chunkCount++
 	}
@@ -302,15 +451,17 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 	}
 	logDebug("Written original file size: %d bytes", fileSize)
 	
-	// Write sparse data section (each chunk padded to 1024 bytes)
-	for i, sparseChunk := range allSparseData {
-		// Pad chunk to 1024 bytes
-		paddedChunk := make([]byte, 1024)
-		copy(paddedChunk, sparseChunk)
-		if _, err := finalFile.Write(paddedChunk); err != nil {
+	// Write permutation data section (12 bytes per chunk: 4 bytes for oneBits + 8 bytes for permutationNum)
+	for i, permData := range allPermutationData {
+		// Write number of 1 bits (4 bytes, uint32 little endian)
+		if err := binary.Write(finalFile, binary.LittleEndian, uint32(permData.OneBits)); err != nil {
 			return err
 		}
-		logDebug("Written sparse chunk %d: %d bytes (padded to 1024)", i, len(sparseChunk))
+		// Write permutation number (8 bytes, uint64 little endian)
+		if err := binary.Write(finalFile, binary.LittleEndian, permData.PermutationNum); err != nil {
+			return err
+		}
+		logDebug("Written permutation chunk %d: %d one bits, permutation %d", i, permData.OneBits, permData.PermutationNum)
 	}
 	
 	// Write metadata section with bit packing
@@ -328,30 +479,11 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 	}
 	rawSize := rawStat.Size()
 	logDebug("Raw XOR file size: %d bytes", rawSize)
-	fmt.Printf("XOR processing complete: %d -> %d bytes\n", fileSize, rawSize)
+	fmt.Printf("Permutation compression complete: %d -> %d bytes (%.1f%% reduction)\n", 
+		fileSize, rawSize, (1.0-float64(rawSize)/float64(fileSize))*100)
 	
-	// Now gzip the entire file
-	fmt.Printf("Applying gzip compression to entire file...\n")
-	gzipDst := dst + ".gz"
-	if err := gzipEntireFile(dst, gzipDst); err != nil {
-		return err
-	}
-	
-	// Get final gzipped size
-	gzipStat, err := os.Stat(gzipDst)
-	if err != nil {
-		return err
-	}
-	finalSize := gzipStat.Size()
-	logDebug("Final gzipped file size: %d bytes", finalSize)
-	
-	fmt.Printf("Final compression: %d -> %d bytes (%.1f%% reduction)\n", 
-		fileSize, finalSize, (1.0-float64(finalSize)/float64(fileSize))*100)
-	fmt.Printf("Gzip improvement: %d -> %d bytes (%.1f%% reduction)\n", 
-		rawSize, finalSize, (1.0-float64(finalSize)/float64(rawSize))*100)
-	
-	// Compare to original (for JPEG testing)
-	if fileSize > finalSize {
+	// Compare to original
+	if fileSize > rawSize {
 		fmt.Printf("SUCCESS: Compressed file is smaller than original!\n")
 	} else {
 		fmt.Printf("Original file was already more compact.\n")
@@ -476,30 +608,11 @@ func compressFile(src, dst string) error {
 	}
 	rawSize := rawStat.Size()
 	logDebug("Raw XOR file size: %d bytes", rawSize)
-	fmt.Printf("XOR processing complete: %d -> %d bytes\n", fileSize, rawSize)
+	fmt.Printf("Permutation compression complete: %d -> %d bytes (%.1f%% reduction)\n", 
+		fileSize, rawSize, (1.0-float64(rawSize)/float64(fileSize))*100)
 	
-	// Now gzip the entire file
-	fmt.Printf("Applying gzip compression to entire file...\n")
-	gzipDst := dst + ".gz"
-	if err := gzipEntireFile(dst, gzipDst); err != nil {
-		return err
-	}
-	
-	// Get final gzipped size
-	gzipStat, err := os.Stat(gzipDst)
-	if err != nil {
-		return err
-	}
-	finalSize := gzipStat.Size()
-	logDebug("Final gzipped file size: %d bytes", finalSize)
-	
-	fmt.Printf("Final compression: %d -> %d bytes (%.1f%% reduction)\n", 
-		fileSize, finalSize, (1.0-float64(finalSize)/float64(fileSize))*100)
-	fmt.Printf("Gzip improvement: %d -> %d bytes (%.1f%% reduction)\n", 
-		rawSize, finalSize, (1.0-float64(finalSize)/float64(rawSize))*100)
-	
-	// Compare to original (for JPEG testing)
-	if fileSize > finalSize {
+	// Compare to original
+	if fileSize > rawSize {
 		fmt.Printf("SUCCESS: Compressed file is smaller than original!\n")
 	} else {
 		fmt.Printf("Original file was already more compact.\n")
@@ -559,18 +672,18 @@ func decompressFileV2(file_content []byte, destFile *os.File) error {
 	numChunks := int((originalSize + 1023) / 1024)
 	logDebug("Expected chunks: %d", numChunks)
 	
-	// Calculate sparse data size (each chunk is 1024 bytes)
-	sparseDataSize := numChunks * 1024
-	sparseDataStart := 5 // after version (1) + original size (4)
-	sparseDataEnd := sparseDataStart + sparseDataSize
+	// Calculate permutation data size (12 bytes per chunk: 4 bytes oneBits + 8 bytes permutationNum)
+	permutationDataSize := numChunks * 12
+	permutationDataStart := 5 // after version (1) + original size (4)
+	permutationDataEnd := permutationDataStart + permutationDataSize
 	
-	if sparseDataEnd > len(file_content) {
-		return fmt.Errorf("file too short for expected sparse data")
+	if permutationDataEnd > len(file_content) {
+		return fmt.Errorf("file too short for expected permutation data")
 	}
 	
-	sparseData := file_content[sparseDataStart:sparseDataEnd]
-	metadataBytes := file_content[sparseDataEnd:]
-	logDebug("Sparse data: %d bytes, Metadata: %d bytes", len(sparseData), len(metadataBytes))
+	permutationData := file_content[permutationDataStart:permutationDataEnd]
+	metadataBytes := file_content[permutationDataEnd:]
+	logDebug("Permutation data: %d bytes, Metadata: %d bytes", len(permutationData), len(metadataBytes))
 	
 	// Decode metadata
 	allCompressionSteps, err := decodeMetadataV2(metadataBytes, numChunks)
@@ -586,10 +699,21 @@ func decompressFileV2(file_content []byte, destFile *os.File) error {
 	totalDecompressed := 0
 	
 	for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
-		// Extract sparse chunk (1024 bytes each)
-		chunkStart := chunkIndex * 1024
-		chunkEnd := chunkStart + 1024
-		compressedChunk := sparseData[chunkStart:chunkEnd]
+		// Extract permutation data for this chunk (12 bytes each)
+		permStart := chunkIndex * 12
+		permEnd := permStart + 12
+		chunkPermData := permutationData[permStart:permEnd]
+		
+		// Read number of 1 bits (4 bytes, uint32 little endian)
+		oneBits := int(binary.LittleEndian.Uint32(chunkPermData[0:4]))
+		
+		// Read permutation number (8 bytes, uint64 little endian)
+		permutationNum := binary.LittleEndian.Uint64(chunkPermData[4:12])
+		
+		logDebug("Chunk %d: recreating from %d one bits, permutation %d", chunkIndex, oneBits, permutationNum)
+		
+		// Recreate the compressed chunk from swap data
+		compressedChunk := recreateFromSwap(1024*8, oneBits, permutationNum)
 		
 		logDebug("Decompressing chunk %d: 1024 bytes", chunkIndex)
 		start := time.Now()
