@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"os"
 	"time"
 )
@@ -135,6 +136,390 @@ func getPrimeIndex(prime int) int {
 	return -1
 }
 
+func getPrimeByIndex(index int) int {
+	if index >= 0 && index < len(primes) {
+		return primes[index]
+	}
+	return -1
+}
+
+// Compress big int using LEB128-style variable length encoding
+func compressBigInt(n *big.Int) []byte {
+	if n.Sign() == 0 {
+		return []byte{0}
+	}
+	
+	// Use the raw bytes but with a more compact representation
+	rawBytes := n.Bytes()
+	
+	// Simple compression: remove leading zeros and add length prefix
+	result := make([]byte, 0, len(rawBytes)+1)
+	
+	// Add length as variable-length integer
+	length := len(rawBytes)
+	for length >= 0x80 {
+		result = append(result, byte(length)|0x80)
+		length >>= 7
+	}
+	result = append(result, byte(length))
+	
+	// Add the raw bytes
+	result = append(result, rawBytes...)
+	
+	return result
+}
+
+// Compress big int delta (can be negative) with sign bit
+func compressBigIntDelta(delta *big.Int) []byte {
+	if delta.Sign() == 0 {
+		return []byte{0}
+	}
+	
+	// Get absolute value and sign
+	absValue := new(big.Int).Abs(delta)
+	isNegative := delta.Sign() < 0
+	
+	rawBytes := absValue.Bytes()
+	result := make([]byte, 0, len(rawBytes)+2)
+	
+	// Add length as variable-length integer, with sign bit in MSB of first byte
+	length := len(rawBytes)
+	firstByte := byte(length & 0x7F)
+	if isNegative {
+		firstByte |= 0x80 // Set sign bit
+	}
+	
+	// Handle length encoding
+	if length >= 0x80 {
+		// For large lengths, we need more complex encoding
+		result = append(result, firstByte)
+		length >>= 7
+		for length >= 0x80 {
+			result = append(result, byte(length)|0x80)
+			length >>= 7
+		}
+		result = append(result, byte(length))
+	} else {
+		// Length fits in 7 bits, sign bit already set
+		result = append(result, firstByte)
+	}
+	
+	// Add the raw bytes
+	result = append(result, rawBytes...)
+	
+	return result
+}
+
+// Decompress big int from variable length encoding
+func decompressBigInt(data []byte) (*big.Int, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+	
+	if data[0] == 0 {
+		return big.NewInt(0), nil
+	}
+	
+	// Read variable-length integer for size
+	var length int
+	var shift int
+	pos := 0
+	
+	for pos < len(data) {
+		b := data[pos]
+		pos++
+		length |= int(b&0x7F) << shift
+		if b&0x80 == 0 {
+			break
+		}
+		shift += 7
+	}
+	
+	if pos+length > len(data) {
+		return nil, fmt.Errorf("invalid length")
+	}
+	
+	// Read the raw bytes
+	rawBytes := data[pos : pos+length]
+	
+	result := new(big.Int)
+	result.SetBytes(rawBytes)
+	
+	return result, nil
+}
+
+// Adaptive compression: choose best method based on data characteristics
+func compressSparseBitPositions(oneBits int, data []byte) []byte {
+	totalBits := len(data) * 8
+	sparsity := float64(oneBits) / float64(totalBits)
+	
+	// Choose compression method based on sparsity
+	if sparsity < 0.3 { // Less than 30% ones - use bit position encoding
+		return compressBitPositions(oneBits, data)
+	} else { // Dense data - use run-length encoding
+		return compressRunLength(data)
+	}
+}
+
+// Compress by storing positions of 1-bits (good for sparse data)
+func compressBitPositions(oneBits int, data []byte) []byte {
+	if oneBits == 0 {
+		return []byte{1} // Type marker: 1 = bit positions, no data
+	}
+	
+	result := []byte{1} // Type marker: 1 = bit positions
+	positions := make([]uint16, 0, oneBits)
+	
+	// Extract positions of all 1-bits
+	for byteIndex := 0; byteIndex < len(data); byteIndex++ {
+		b := data[byteIndex]
+		if b == 0 {
+			continue // Skip bytes with no bits set
+		}
+		
+		for bitIndex := 0; bitIndex < 8; bitIndex++ {
+			if (b >> (7 - bitIndex)) & 1 == 1 {
+				position := uint16(byteIndex*8 + bitIndex)
+				positions = append(positions, position)
+			}
+		}
+	}
+	
+	// Store first position as-is (2 bytes)
+	if len(positions) > 0 {
+		firstPos := positions[0]
+		result = append(result, byte(firstPos&0xFF), byte(firstPos>>8))
+		
+		// Store deltas using variable-length encoding
+		for i := 1; i < len(positions); i++ {
+			delta := positions[i] - positions[i-1]
+			
+			// Variable length encoding for deltas
+			for delta >= 0x80 {
+				result = append(result, byte(delta)|0x80)
+				delta >>= 7
+			}
+			result = append(result, byte(delta))
+		}
+	}
+	
+	return result
+}
+
+// Compress using run-length encoding (good for dense data)
+func compressRunLength(data []byte) []byte {
+	if len(data) == 0 {
+		return []byte{2} // Type marker: 2 = RLE, no data
+	}
+	
+	result := []byte{2} // Type marker: 2 = RLE
+	
+	// RLE encoding: count consecutive 0s and 1s
+	currentBit := (data[0] >> 7) & 1
+	runLength := 0
+	
+	for byteIndex := 0; byteIndex < len(data); byteIndex++ {
+		b := data[byteIndex]
+		for bitIndex := 0; bitIndex < 8; bitIndex++ {
+			bit := (b >> (7 - bitIndex)) & 1
+			
+			if bit == currentBit {
+				runLength++
+			} else {
+				// Encode the run
+				result = append(result, encodeRunLength(runLength)...)
+				currentBit = bit
+				runLength = 1
+			}
+		}
+	}
+	
+	// Encode final run
+	result = append(result, encodeRunLength(runLength)...)
+	
+	return result
+}
+
+// Encode run length using variable-length encoding
+func encodeRunLength(length int) []byte {
+	if length == 0 {
+		return []byte{0}
+	}
+	
+	result := make([]byte, 0, 4)
+	for length >= 0x80 {
+		result = append(result, byte(length)|0x80)
+		length >>= 7
+	}
+	result = append(result, byte(length))
+	
+	return result
+}
+
+// Decompress adaptive compressed data
+func decompressSparseBitPositions(compressedData []byte, oneBits int, dataSize int) []byte {
+	result := make([]byte, dataSize)
+	
+	if len(compressedData) == 0 {
+		return result
+	}
+	
+	// Check type marker
+	typeMarker := compressedData[0]
+	switch typeMarker {
+	case 1: // Bit positions
+		return decompressBitPositions(compressedData[1:], oneBits, dataSize)
+	case 2: // Run-length encoding
+		return decompressRunLength(compressedData[1:], dataSize)
+	default:
+		return result // Unknown format, return all zeros
+	}
+}
+
+// Decompress bit positions back to sparse binary data
+func decompressBitPositions(compressedData []byte, oneBits int, dataSize int) []byte {
+	result := make([]byte, dataSize)
+	
+	if oneBits == 0 || len(compressedData) == 0 {
+		return result // All zeros
+	}
+	
+	if len(compressedData) < 2 {
+		return result // Invalid data
+	}
+	
+	// Read first position
+	firstPos := uint16(compressedData[0]) | (uint16(compressedData[1]) << 8)
+	positions := []uint16{firstPos}
+	
+	// Decode deltas
+	pos := 2
+	currentPos := firstPos
+	
+	for pos < len(compressedData) && len(positions) < oneBits {
+		var delta uint16
+		var shift uint
+		
+		for pos < len(compressedData) {
+			b := compressedData[pos]
+			pos++
+			delta |= uint16(b&0x7F) << shift
+			if b&0x80 == 0 {
+				break
+			}
+			shift += 7
+		}
+		
+		currentPos += delta
+		positions = append(positions, currentPos)
+	}
+	
+	// Set bits at positions
+	for _, position := range positions {
+		if int(position) < dataSize*8 {
+			byteIndex := position / 8
+			bitIndex := position % 8
+			result[byteIndex] |= 1 << (7 - bitIndex)
+		}
+	}
+	
+	return result
+}
+
+// Decompress run-length encoded data
+func decompressRunLength(compressedData []byte, dataSize int) []byte {
+	result := make([]byte, dataSize)
+	
+	if len(compressedData) == 0 {
+		return result
+	}
+	
+	// Start with bit 0 (assuming first run is zeros)
+	currentBit := byte(0)
+	bitPosition := 0
+	pos := 0
+	
+	for pos < len(compressedData) && bitPosition < dataSize*8 {
+		// Decode run length
+		runLength := 0
+		var shift uint
+		
+		for pos < len(compressedData) {
+			b := compressedData[pos]
+			pos++
+			runLength |= int(b&0x7F) << shift
+			if b&0x80 == 0 {
+				break
+			}
+			shift += 7
+		}
+		
+		// Fill the run
+		for i := 0; i < runLength && bitPosition < dataSize*8; i++ {
+			if currentBit == 1 {
+				byteIndex := bitPosition / 8
+				bitIndex := bitPosition % 8
+				result[byteIndex] |= 1 << (7 - bitIndex)
+			}
+			bitPosition++
+		}
+		
+		// Toggle bit for next run
+		currentBit = 1 - currentBit
+	}
+	
+	return result
+}
+
+// Decompress big int delta with sign bit
+func decompressBigIntDelta(data []byte) (*big.Int, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty data")
+	}
+	
+	if data[0] == 0 {
+		return big.NewInt(0), nil
+	}
+	
+	// Read first byte to get sign and partial length
+	firstByte := data[0]
+	isNegative := (firstByte & 0x80) != 0
+	length := int(firstByte & 0x7F)
+	pos := 1
+	
+	// Handle extended length encoding if needed
+	if length == 0x7F && pos < len(data) && (data[pos]&0x80) != 0 {
+		// Extended length encoding
+		var shift int = 7
+		for pos < len(data) {
+			b := data[pos]
+			pos++
+			length |= int(b&0x7F) << shift
+			if b&0x80 == 0 {
+				break
+			}
+			shift += 7
+		}
+	}
+	
+	if pos+length > len(data) {
+		return nil, fmt.Errorf("invalid delta length")
+	}
+	
+	// Read the raw bytes
+	rawBytes := data[pos : pos+length]
+	
+	result := new(big.Int)
+	result.SetBytes(rawBytes)
+	
+	// Apply sign
+	if isNegative {
+		result.Neg(result)
+	}
+	
+	return result, nil
+}
+
 // Permutation compression functions
 func countOneBits(data []byte) int {
 	count := 0
@@ -163,7 +548,7 @@ func generateInitialBitPattern(totalBits, oneBits int) []byte {
 	return result
 }
 
-func performSwap(data []byte, totalBits int, swapNum uint64) {
+func performSwaps(data []byte, totalBits int, numSwaps uint64) {
 	// Convert bytes to bit array for easier manipulation
 	bits := make([]bool, totalBits)
 	for i := 0; i < totalBits; i++ {
@@ -172,29 +557,25 @@ func performSwap(data []byte, totalBits int, swapNum uint64) {
 		bits[i] = (data[byteIndex] >> (7 - bitIndex)) & 1 == 1
 	}
 	
-	// Find all 0 and 1 positions
-	var zeroPositions []int
-	var onePositions []int
-	
-	for i := 0; i < totalBits; i++ {
-		if bits[i] {
-			onePositions = append(onePositions, i)
-		} else {
-			zeroPositions = append(zeroPositions, i)
+	// Perform numSwaps number of adjacent swaps
+	// This implements a bubble-sort like approach to reach any permutation
+	for swap := uint64(0); swap < numSwaps; swap++ {
+		// Find adjacent 01 pattern and swap to 10
+		swapped := false
+		for i := 0; i < totalBits-1; i++ {
+			if !bits[i] && bits[i+1] {
+				// Found 01, swap to 10
+				bits[i] = true
+				bits[i+1] = false
+				swapped = true
+				break
+			}
 		}
-	}
-	
-	// Calculate which 0 and 1 to swap based on swapNum
-	// We can represent swapNum as choosing pairs (0_index, 1_index)
-	if len(zeroPositions) > 0 && len(onePositions) > 0 {
-		zeroIdx := int(swapNum % uint64(len(zeroPositions)))
-		oneIdx := int((swapNum / uint64(len(zeroPositions))) % uint64(len(onePositions)))
 		
-		// Swap the bits
-		zeroPos := zeroPositions[zeroIdx]
-		onePos := onePositions[oneIdx]
-		bits[zeroPos] = true
-		bits[onePos] = false
+		// If no more adjacent swaps possible, we've reached a canonical form
+		if !swapped {
+			break
+		}
 	}
 	
 	// Convert back to bytes
@@ -210,35 +591,156 @@ func performSwap(data []byte, totalBits int, swapNum uint64) {
 	}
 }
 
-func findSwapNumber(target []byte, oneBits int) uint64 {
+// Combinatorial coefficient C(n,k) = n! / (k! * (n-k)!) using big integers
+func binomialCoeffBig(n, k int) *big.Int {
+	if k > n || k < 0 {
+		return big.NewInt(0)
+	}
+	if k == 0 || k == n {
+		return big.NewInt(1)
+	}
+	if k > n-k {
+		k = n - k // Take advantage of symmetry
+	}
+	
+	result := big.NewInt(1)
+	for i := 0; i < k; i++ {
+		// result = result * (n-i) / (i+1)
+		numerator := big.NewInt(int64(n - i))
+		denominator := big.NewInt(int64(i + 1))
+		
+		result.Mul(result, numerator)
+		result.Div(result, denominator)
+	}
+	return result
+}
+
+// Legacy function for compatibility - converts big int to uint64 with overflow check
+func binomialCoeff(n, k int) uint64 {
+	bigResult := binomialCoeffBig(n, k)
+	
+	// Check if it fits in uint64
+	maxUint64 := new(big.Int)
+	maxUint64.SetUint64(^uint64(0))
+	
+	if bigResult.Cmp(maxUint64) > 0 {
+		fmt.Printf("WARNING: Binomial coefficient C(%d,%d) exceeds uint64, returning max\n", n, k)
+		return ^uint64(0)
+	}
+	
+	return bigResult.Uint64()
+}
+
+func calculateCombinadicNumberBig(target []byte, oneBits int) *big.Int {
 	totalBits := len(target) * 8
-	initial := generateInitialBitPattern(totalBits, oneBits)
 	
-	// Calculate max possible swaps: zeros * ones
-	zeros := totalBits - oneBits
-	maxSwaps := uint64(zeros * oneBits)
-	
-	fmt.Printf("DEBUG: Searching among %d possible swaps...\n", maxSwaps)
-	
-	for swapNum := uint64(0); swapNum < maxSwaps; swapNum++ {
-		current := make([]byte, len(initial))
-		copy(current, initial)
-		
-		performSwap(current, totalBits, swapNum)
-		
-		if bytesEqual(current, target) {
-			fmt.Printf("DEBUG: Found match at swap %d\n", swapNum)
-			return swapNum
-		}
-		
-		// Progress reporting
-		if swapNum % 10000 == 0 && swapNum > 0 {
-			fmt.Printf("DEBUG: Tested swap %d of %d...\n", swapNum, maxSwaps)
+	// Find positions of 1s in target (these are the chosen positions)
+	var onePositions []int
+	for i := 0; i < totalBits; i++ {
+		byteIndex := i / 8
+		bitIndex := i % 8
+		if (target[byteIndex] >> (7 - bitIndex)) & 1 == 1 {
+			onePositions = append(onePositions, i)
 		}
 	}
 	
-	fmt.Printf("DEBUG: No exact match found, returning 0\n")
-	return 0
+	if len(onePositions) != oneBits {
+		fmt.Printf("ERROR: Expected %d one bits, found %d\n", oneBits, len(onePositions))
+		return big.NewInt(0)
+	}
+	
+	// Sort positions in descending order for combinadic calculation
+	// Reverse the array so we have descending order
+	for i := 0; i < len(onePositions)/2; i++ {
+		j := len(onePositions) - 1 - i
+		onePositions[i], onePositions[j] = onePositions[j], onePositions[i]
+	}
+	
+	// Convert combination to combinadic number using standard algorithm
+	// For combination {c_k, c_k-1, ..., c_1} in descending order
+	combinadicNum := big.NewInt(0)
+	
+	for i, pos := range onePositions {
+		k := oneBits - i // k starts at oneBits and decreases
+		if pos >= k-1 && k > 0 {
+			coeff := binomialCoeffBig(pos, k)
+			combinadicNum.Add(combinadicNum, coeff)
+		}
+	}
+	
+	return combinadicNum
+}
+
+// Legacy wrapper that converts to uint64 with overflow detection
+func calculateCombinadicNumber(target []byte, oneBits int) uint64 {
+	bigResult := calculateCombinadicNumberBig(target, oneBits)
+	
+	// Check if it fits in uint64
+	maxUint64 := new(big.Int)
+	maxUint64.SetUint64(^uint64(0))
+	
+	if bigResult.Cmp(maxUint64) > 0 {
+		return ^uint64(0)
+	}
+	
+	return bigResult.Uint64()
+}
+
+func reconstructFromCombinadicBig(totalBits, oneBits int, combinadicNum *big.Int) []byte {
+	result := make([]byte, (totalBits+7)/8)
+	
+	// Convert combinadic number back to combination positions
+	var positions []int
+	remaining := new(big.Int).Set(combinadicNum)
+	
+	// Debug: Check for potential overflow
+	totalCombinations := binomialCoeffBig(totalBits, oneBits)
+	if combinadicNum.Cmp(totalCombinations) >= 0 {
+		fmt.Printf("ERROR: combinadicNum %s >= total combinations %s\n", combinadicNum.String(), totalCombinations.String())
+		return result
+	}
+	
+	// Standard combinadic reconstruction algorithm
+	for k := oneBits; k > 0; k-- {
+		// Find largest n such that C(n,k) <= remaining
+		n := k - 1
+		for n < totalBits {
+			coeff := binomialCoeffBig(n, k)
+			if coeff.Cmp(remaining) > 0 {
+				break
+			}
+			n++
+		}
+		n-- // n is now the largest value where C(n,k) <= remaining
+		
+		positions = append(positions, n)
+		if n >= k-1 {
+			coeff := binomialCoeffBig(n, k)
+			remaining.Sub(remaining, coeff)
+		}
+	}
+	
+	// Debug: Show positions (these are in descending order from the algorithm)
+	if len(positions) <= 10 {
+		fmt.Printf("DEBUG: Reconstructed positions (descending): %v\n", positions)
+	}
+	
+	// Set bits at these positions (no need to reverse - positions are correct)
+	for _, pos := range positions {
+		if pos < totalBits && pos >= 0 {
+			byteIndex := pos / 8
+			bitIndex := pos % 8
+			result[byteIndex] |= 1 << (7 - bitIndex)
+		}
+	}
+	
+	return result
+}
+
+// Legacy wrapper for uint64 compatibility
+func reconstructFromCombinadic(totalBits, oneBits int, combinadicNum uint64) []byte {
+	bigNum := new(big.Int).SetUint64(combinadicNum)
+	return reconstructFromCombinadicBig(totalBits, oneBits, bigNum)
 }
 
 func bytesEqual(a, b []byte) bool {
@@ -253,18 +755,113 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-func recreateFromSwap(totalBits, oneBits int, swapNum uint64) []byte {
-	current := generateInitialBitPattern(totalBits, oneBits)
-	performSwap(current, totalBits, swapNum)
-	return current
+func recreateFromCombinadic(totalBits, oneBits int, combinadicNum uint64) []byte {
+	return reconstructFromCombinadic(totalBits, oneBits, combinadicNum)
+}
+
+func testPermutation() {
+	// Test with large case using big integers
+	totalBits := 256 // 32 bytes
+	oneBits := 32
+	
+	fmt.Printf("Testing permutation with %d total bits, %d one bits\n", totalBits, oneBits)
+	
+	// Create test with 32 ones spread across 256 bits  
+	testData := make([]byte, 32)
+	// Set ones at every 8th position: 0, 8, 16, 24, ..., 248
+	positions := make([]int, oneBits)
+	for i := 0; i < oneBits; i++ {
+		positions[i] = i * 8
+		byteIndex := positions[i] / 8
+		bitIndex := positions[i] % 8
+		testData[byteIndex] |= 1 << (7 - bitIndex)
+	}
+	
+	fmt.Printf("Test positions (first 8): %v\n", positions[:8])
+	totalCombinationsBig := binomialCoeffBig(totalBits, oneBits)
+	fmt.Printf("Expected total combinations C(%d,%d) = %s\n", totalBits, oneBits, totalCombinationsBig.String())
+	
+	// Verify we have exactly 32 one bits
+	actualOneBits := countOneBits(testData)
+	fmt.Printf("Created test data with %d one bits (expected %d)\n", actualOneBits, oneBits)
+	fmt.Printf("Test data first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n", 
+		testData[0], testData[1], testData[2], testData[3], testData[4], testData[5], testData[6], testData[7])
+	
+	if actualOneBits != oneBits {
+		fmt.Printf("ERROR: Bit count mismatch!\n")
+		return
+	}
+	
+	// Show what the positions look like
+	fmt.Printf("Bit positions in testData:\n")
+	for i := 0; i < totalBits; i++ {
+		byteIndex := i / 8
+		bitIndex := i % 8
+		bit := (testData[byteIndex] >> (7 - bitIndex)) & 1
+		if bit == 1 {
+			fmt.Printf("  Position %d: 1\n", i)
+		}
+	}
+	
+	// Calculate combinadic number using big integers
+	fmt.Printf("\nCalculating combinadic number...\n")
+	
+	// Test the big integer combinadic calculation
+	combinadicNumBig := calculateCombinadicNumberBig(testData, oneBits)
+	fmt.Printf("Calculated combinadic number (big): %s\n", combinadicNumBig.String())
+	
+	// Also try the legacy version to see the warning
+	combinadicNum := calculateCombinadicNumber(testData, oneBits)
+	fmt.Printf("Legacy uint64 result: %d\n", combinadicNum)
+	
+	// Test the inverse operation (decompression) using big integers
+	fmt.Printf("\nTesting inverse operation (decompression):\n")
+	fmt.Printf("Original test data: %02x %02x %02x %02x %02x %02x %02x %02x\n", 
+		testData[0], testData[1], testData[2], testData[3], testData[4], testData[5], testData[6], testData[7])
+	fmt.Printf("Calculated combinadic number (big): %s\n", combinadicNumBig.String())
+	fmt.Printf("One bits: %d\n", oneBits)
+	
+	// Recreate using the calculated big integer combinadic number
+	recreated := reconstructFromCombinadicBig(totalBits, oneBits, combinadicNumBig)
+	fmt.Printf("Recreated data: %02x %02x %02x %02x %02x %02x %02x %02x\n", 
+		recreated[0], recreated[1], recreated[2], recreated[3], recreated[4], recreated[5], recreated[6], recreated[7])
+	
+	// Show recreated positions
+	fmt.Printf("Recreated bit positions:\n")
+	for i := 0; i < totalBits; i++ {
+		byteIndex := i / 8
+		bitIndex := i % 8
+		bit := (recreated[byteIndex] >> (7 - bitIndex)) & 1
+		if bit == 1 {
+			fmt.Printf("  Position %d: 1\n", i)
+		}
+	}
+	
+	if bytesEqual(testData, recreated) {
+		fmt.Printf("SUCCESS: Perfect round-trip compression/decompression!\n")
+	} else {
+		fmt.Printf("ERROR: Round-trip failed!\n")
+		
+		// Show bit-by-bit comparison
+		fmt.Printf("Bit comparison:\n")
+		for i := 0; i < totalBits; i++ {
+			originalBit := (testData[i/8] >> (7 - (i % 8))) & 1
+			recreatedBit := (recreated[i/8] >> (7 - (i % 8))) & 1
+			if originalBit != recreatedBit {
+				fmt.Printf("  Bit %d: original=%d, recreated=%d\n", i, originalBit, recreatedBit)
+			}
+		}
+	}
 }
 
 func main() {
 	var compressFlag bool
 	var decompressFlag bool
+	var testFlag bool
 	var primeLimit int
 	flag.BoolVar(&compressFlag, "c", false, "Compress source file to destination file")
 	flag.BoolVar(&decompressFlag, "d", false, "Decompress source file to destination file")
+	flag.BoolVar(&testFlag, "test", false, "Run permutation algorithm test")
 	flag.BoolVar(&verboseMode, "v", false, "Enable verbose logging to debug.log")
 	flag.IntVar(&primeLimit, "primes", 50, "Number of primes to test per chunk (0 = test all available primes)")
 	flag.Parse()
@@ -273,9 +870,14 @@ func main() {
 		initDebugLogging()
 	}
 
+	if testFlag {
+		testPermutation()
+		return
+	}
+
 	args := flag.Args()
 	if len(args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-c|-d] <source> <destination>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-c|-d] [-test] <source> <destination>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -345,7 +947,7 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 	var allCompressionSteps [][]CompressionStep
 	var allPermutationData []struct {
 		OneBits         int
-		PermutationNum  uint64
+		CompressedData  []byte
 	}
 	chunkCount := 0
 	bytesProcessed := int64(0)
@@ -366,9 +968,20 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 		
 		start := time.Now()
 		compressedData, steps := compressChunkWithPrimeLimit(chunk, primeLimit)
+		
+		allCompressionSteps = append(allCompressionSteps, steps)
+		
+		// Count 1 bits in compressed data and find permutation number
+		oneBits := countOneBits(compressedData)
+		
+		// Pad to 1024 bytes for permutation calculation
+		paddedData := make([]byte, 1024)
+		copy(paddedData, compressedData)
+		
+		compressedBytes := compressSparseBitPositions(oneBits, paddedData)
 		duration := time.Since(start)
 		
-		// Calculate time estimates
+		// Calculate time estimates (including combinadic calculation)
 		if chunkCount == 0 {
 			avgChunkTime = duration
 		} else {
@@ -381,7 +994,7 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 		
 		// Format time estimates
 		timeStr := ""
-		if chunkCount > 2 { // Show estimates after a few chunks for accuracy
+		if chunkCount > 0 { // Show estimates after first chunk
 			if estimatedRemaining < time.Minute {
 				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
 			} else if estimatedRemaining < time.Hour {
@@ -392,37 +1005,18 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 		}
 		
 		fmt.Printf("\rProgress: %.1f%% (%d/%d chunks)%s", progress, chunkCount+1, totalChunks, timeStr)
-		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
 		
+		logDebug("Processing chunk %d: %d bytes", chunkCount, len(chunk))
 		logDebug("Chunk %d compressed: %d -> %d bytes (%.3f ratio) in %v", 
 			chunkCount, len(chunk), len(compressedData), 
 			float64(len(compressedData))/float64(len(chunk)), duration)
 		logDebug("Chunk %d compression steps: %d operations", chunkCount, len(steps))
-		
-		allCompressionSteps = append(allCompressionSteps, steps)
-		
-		// Count 1 bits in compressed data and find permutation number
-		oneBits := countOneBits(compressedData)
-		
-		// Pad to 1024 bytes for permutation calculation
-		paddedData := make([]byte, 1024)
-		copy(paddedData, compressedData)
-		
-		fmt.Printf("DEBUG: Chunk %d has %d bytes, %d one bits\n", chunkCount, len(compressedData), oneBits)
-		if len(compressedData) >= 4 {
-			fmt.Printf("DEBUG: First few bytes: %02x %02x %02x %02x\n", compressedData[0], compressedData[1], compressedData[2], compressedData[3])
-		} else {
-			fmt.Printf("DEBUG: All bytes: %02x\n", compressedData)
-		}
-		
-		swapNum := findSwapNumber(paddedData, oneBits)
-		fmt.Printf("DEBUG: Found swap number: %d\n", swapNum)
-		logDebug("Chunk %d: %d one bits, swap %d", chunkCount, oneBits, swapNum)
+		logDebug("Chunk %d: %d one bits, compressed to %d bytes", chunkCount, oneBits, len(compressedBytes))
 		
 		allPermutationData = append(allPermutationData, struct {
 			OneBits         int
-			PermutationNum  uint64
-		}{oneBits, swapNum})
+			CompressedData  []byte
+		}{oneBits, compressedBytes})
 		
 		chunkCount++
 	}
@@ -451,26 +1045,60 @@ func compressFileWithPrimeLimit(src, dst string, primeLimit int) error {
 	}
 	logDebug("Written original file size: %d bytes", fileSize)
 	
-	// Write permutation data section (12 bytes per chunk: 4 bytes for oneBits + 8 bytes for permutationNum)
+	// Using bit position encoding - no average needed
+	
+	// Write chunk data section with bit position encoding
 	for i, permData := range allPermutationData {
 		// Write number of 1 bits (4 bytes, uint32 little endian)
 		if err := binary.Write(finalFile, binary.LittleEndian, uint32(permData.OneBits)); err != nil {
 			return err
 		}
-		// Write permutation number (8 bytes, uint64 little endian)
-		if err := binary.Write(finalFile, binary.LittleEndian, permData.PermutationNum); err != nil {
+		
+		// Get compressed data from the pre-computed data
+		compressedBytes := permData.CompressedData
+		
+		// Write compressed big int length (4 bytes, uint32 little endian)
+		if err := binary.Write(finalFile, binary.LittleEndian, uint32(len(compressedBytes))); err != nil {
 			return err
 		}
-		logDebug("Written permutation chunk %d: %d one bits, permutation %d", i, permData.OneBits, permData.PermutationNum)
+		// Write compressed big int bytes
+		if _, err := finalFile.Write(compressedBytes); err != nil {
+			return err
+		}
+		
+		// Encode metadata for this chunk only
+		chunkMetadata := encodeChunkMetadata(allCompressionSteps[i])
+		// Write metadata length (2 bytes, uint16 little endian)
+		if err := binary.Write(finalFile, binary.LittleEndian, uint16(len(chunkMetadata))); err != nil {
+			return err
+		}
+		// Write metadata bytes
+		if _, err := finalFile.Write(chunkMetadata); err != nil {
+			return err
+		}
+		
+		compressionType := "unknown"
+		if len(compressedBytes) > 0 {
+			if compressedBytes[0] == 1 {
+				compressionType = "bit-positions"
+			} else if compressedBytes[0] == 2 {
+				compressionType = "run-length"
+			}
+		}
+		logDebug("Written chunk %d: %d one bits, (%d bytes %s compressed), metadata (%d bytes)", 
+			i, permData.OneBits, len(compressedBytes), compressionType, len(chunkMetadata))
+		logDebug("Space comparison chunk %d: sparse data=1024 bytes vs %s=%d bytes (%.1f%% of original)", 
+			i, compressionType, len(compressedBytes), float64(len(compressedBytes))*100.0/1024.0)
 	}
 	
-	// Write metadata section with bit packing
-	metadataBytes := encodeMetadataV2(allCompressionSteps)
-	logDebug("Metadata v2 encoded: %d bytes for %d chunks", len(metadataBytes), len(allCompressionSteps))
-
-	if _, err := finalFile.Write(metadataBytes); err != nil {
-		return err
+	// Calculate total space comparison
+	totalSparseBytes := len(allPermutationData) * 1024
+	totalBitPositionBytes := 0
+	for _, permData := range allPermutationData {
+		totalBitPositionBytes += len(permData.CompressedData)
 	}
+	logDebug("Total space comparison: sparse data=%d bytes vs adaptive-compression=%d bytes (%.1f%% of original)", 
+		totalSparseBytes, totalBitPositionBytes, float64(totalBitPositionBytes)*100.0/float64(totalSparseBytes))
 	
 	// Get raw file size
 	rawStat, err := os.Stat(dst)
@@ -551,7 +1179,7 @@ func compressFile(src, dst string) error {
 		
 		// Format time estimates
 		timeStr := ""
-		if chunkCount > 2 { // Show estimates after a few chunks for accuracy
+		if chunkCount > 0 { // Show estimates after first chunk
 			if estimatedRemaining < time.Minute {
 				timeStr = fmt.Sprintf(" ETA: %ds", int(estimatedRemaining.Seconds()))
 			} else if estimatedRemaining < time.Hour {
@@ -672,25 +1300,75 @@ func decompressFileV2(file_content []byte, destFile *os.File) error {
 	numChunks := int((originalSize + 1023) / 1024)
 	logDebug("Expected chunks: %d", numChunks)
 	
-	// Calculate permutation data size (12 bytes per chunk: 4 bytes oneBits + 8 bytes permutationNum)
-	permutationDataSize := numChunks * 12
-	permutationDataStart := 5 // after version (1) + original size (4)
-	permutationDataEnd := permutationDataStart + permutationDataSize
+	// Read streaming chunk data (bit positions + metadata per chunk)
+	dataStart := 5 // after version (1) + original size (4)
 	
-	if permutationDataEnd > len(file_content) {
-		return fmt.Errorf("file too short for expected permutation data")
+	// Parse chunks in streaming format with bit position decoding
+	var allChunkData []struct {
+		OneBits         int
+		SparseData      []byte
+		Metadata        []CompressionStep
 	}
 	
-	permutationData := file_content[permutationDataStart:permutationDataEnd]
-	metadataBytes := file_content[permutationDataEnd:]
-	logDebug("Permutation data: %d bytes, Metadata: %d bytes", len(permutationData), len(metadataBytes))
-	
-	// Decode metadata
-	allCompressionSteps, err := decodeMetadataV2(metadataBytes, numChunks)
-	if err != nil {
-		return err
+	offset := dataStart
+	for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
+		if offset+8 > len(file_content) {
+			return fmt.Errorf("file too short for chunk %d data", chunkIndex)
+		}
+		
+		// Read number of 1 bits (4 bytes, uint32 little endian)
+		oneBits := int(binary.LittleEndian.Uint32(file_content[offset:offset+4]))
+		offset += 4
+		
+		// Read big int length (4 bytes, uint32 little endian)
+		bigIntLen := int(binary.LittleEndian.Uint32(file_content[offset:offset+4]))
+		offset += 4
+		
+		if offset+bigIntLen > len(file_content) {
+			return fmt.Errorf("file too short for big int data chunk %d", chunkIndex)
+		}
+		
+		// Read compressed big int bytes
+		compressedBytes := file_content[offset:offset+bigIntLen]
+		offset += bigIntLen
+		
+		// Decompress bit positions to sparse data
+		sparseData := decompressSparseBitPositions(compressedBytes, oneBits, 1024)
+		if sparseData == nil {
+			return fmt.Errorf("failed to decompress bit positions for chunk %d", chunkIndex)
+		}
+		
+		// Read metadata length (2 bytes, uint16 little endian)
+		if offset+2 > len(file_content) {
+			return fmt.Errorf("file too short for metadata length chunk %d", chunkIndex)
+		}
+		metadataLen := int(binary.LittleEndian.Uint16(file_content[offset:offset+2]))
+		offset += 2
+		
+		if offset+metadataLen > len(file_content) {
+			return fmt.Errorf("file too short for metadata chunk %d", chunkIndex)
+		}
+		
+		// Read and decode metadata for this chunk
+		chunkMetadataBytes := file_content[offset:offset+metadataLen]
+		offset += metadataLen
+		
+		chunkMetadata, err := decodeChunkMetadata(chunkMetadataBytes)
+		if err != nil {
+			return fmt.Errorf("failed to decode metadata for chunk %d: %v", chunkIndex, err)
+		}
+		
+		allChunkData = append(allChunkData, struct {
+			OneBits         int
+			SparseData      []byte
+			Metadata        []CompressionStep
+		}{oneBits, sparseData, chunkMetadata})
+		
+		logDebug("Read chunk %d: %d one bits (%d bytes bit-position compressed), metadata (%d ops, %d bytes)", 
+			chunkIndex, oneBits, bigIntLen, len(chunkMetadata), metadataLen)
 	}
-	logDebug("Decoded metadata for %d chunks", len(allCompressionSteps))
+	
+	logDebug("Read all chunk data: %d bytes total", offset-dataStart)
 	
 	fmt.Printf("Decompressing %d chunks...\n", numChunks)
 	
@@ -699,25 +1377,16 @@ func decompressFileV2(file_content []byte, destFile *os.File) error {
 	totalDecompressed := 0
 	
 	for chunkIndex := 0; chunkIndex < numChunks; chunkIndex++ {
-		// Extract permutation data for this chunk (12 bytes each)
-		permStart := chunkIndex * 12
-		permEnd := permStart + 12
-		chunkPermData := permutationData[permStart:permEnd]
+		// Get chunk data (sparse data + metadata)
+		chunkData := allChunkData[chunkIndex]
+		sparseData := chunkData.SparseData
+		metadata := chunkData.Metadata
 		
-		// Read number of 1 bits (4 bytes, uint32 little endian)
-		oneBits := int(binary.LittleEndian.Uint32(chunkPermData[0:4]))
-		
-		// Read permutation number (8 bytes, uint64 little endian)
-		permutationNum := binary.LittleEndian.Uint64(chunkPermData[4:12])
-		
-		logDebug("Chunk %d: recreating from %d one bits, permutation %d", chunkIndex, oneBits, permutationNum)
-		
-		// Recreate the compressed chunk from swap data
-		compressedChunk := recreateFromSwap(1024*8, oneBits, permutationNum)
+		logDebug("Chunk %d: decompressing sparse data (%d bytes)", chunkIndex, len(sparseData))
 		
 		logDebug("Decompressing chunk %d: 1024 bytes", chunkIndex)
 		start := time.Now()
-		originalData := decompressChunk(compressedChunk, allCompressionSteps[chunkIndex])
+		originalData := decompressChunk(sparseData, metadata)
 		duration := time.Since(start)
 		
 		// Calculate decompression time estimates
@@ -1179,6 +1848,117 @@ func encodeMetadataWithDelimiters(allSteps [][]CompressionStep) []byte {
 	}
 	
 	return result
+}
+
+// Encode metadata for a single chunk
+func encodeChunkMetadata(steps []CompressionStep) []byte {
+	var result []byte
+	
+	// Write operation count for this chunk (2 bytes, uint16 little endian)
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, uint16(len(steps)))
+	result = append(result, buf...)
+	logDebug("Chunk operations: %d", len(steps))
+	
+	// Bit pack operations for this chunk
+	bitBuffer := make([]int, 0)
+	
+	for _, step := range steps {
+		if step.Operation == "negate" && step.Applied {
+			// Negate operation: 1 bit (1)
+			bitBuffer = append(bitBuffer, 1)
+			logDebug("Added negate bit: 1")
+		} else if step.Operation == "xor" && step.Applied {
+			// XOR operation: 1 bit (0) + 11 bits for prime index
+			bitBuffer = append(bitBuffer, 0)
+			primeIndex := getPrimeIndex(step.Prime)
+			// Pack 11-bit prime index
+			for i := 10; i >= 0; i-- {
+				bit := (primeIndex >> i) & 1
+				bitBuffer = append(bitBuffer, bit)
+			}
+			logDebug("Added XOR operation: prime %d (index %d)", step.Prime, primeIndex)
+		}
+	}
+	
+	// Convert bit buffer to bytes
+	for i := 0; i < len(bitBuffer); i += 8 {
+		var b byte
+		for j := 0; j < 8 && i+j < len(bitBuffer); j++ {
+			if bitBuffer[i+j] == 1 {
+				b |= 1 << (7 - j)
+			}
+		}
+		result = append(result, b)
+	}
+	
+	logDebug("Encoded chunk metadata: %d operations -> %d bytes", len(steps), len(result))
+	return result
+}
+
+// Decode metadata for a single chunk
+func decodeChunkMetadata(data []byte) ([]CompressionStep, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("metadata too short")
+	}
+	
+	// Read operation count (2 bytes, uint16 little endian)
+	opCount := int(binary.LittleEndian.Uint16(data[0:2]))
+	logDebug("Decoding chunk metadata: %d operations", opCount)
+	
+	// Convert bytes to bit buffer
+	bitBuffer := make([]int, 0)
+	for i := 2; i < len(data); i++ {
+		b := data[i]
+		for j := 7; j >= 0; j-- {
+			bit := int((b >> j) & 1)
+			bitBuffer = append(bitBuffer, bit)
+		}
+	}
+	
+	// Decode operations from bit buffer
+	var steps []CompressionStep
+	bitIndex := 0
+	
+	for len(steps) < opCount && bitIndex < len(bitBuffer) {
+		if bitBuffer[bitIndex] == 1 {
+			// Negate operation
+			steps = append(steps, CompressionStep{
+				Operation: "negate",
+				Prime:     0,
+				Applied:   true,
+			})
+			bitIndex++
+			logDebug("Decoded negate operation")
+		} else {
+			// XOR operation: 1 bit (0) + 11 bits for prime index
+			if bitIndex+11 >= len(bitBuffer) {
+				break // Not enough bits for complete XOR operation
+			}
+			bitIndex++ // Skip the 0 bit
+			
+			// Extract 11-bit prime index
+			primeIndex := 0
+			for i := 0; i < 11; i++ {
+				primeIndex = (primeIndex << 1) | bitBuffer[bitIndex]
+				bitIndex++
+			}
+			
+			prime := getPrimeByIndex(primeIndex)
+			steps = append(steps, CompressionStep{
+				Operation: "xor",
+				Prime:     prime,
+				Applied:   true,
+			})
+			logDebug("Decoded XOR operation: prime %d (index %d)", prime, primeIndex)
+		}
+	}
+	
+	if len(steps) != opCount {
+		return nil, fmt.Errorf("decoded %d operations but expected %d", len(steps), opCount)
+	}
+	
+	return steps, nil
 }
 
 func encodeMetadataV2(allSteps [][]CompressionStep) []byte {

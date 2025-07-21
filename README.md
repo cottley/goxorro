@@ -1,14 +1,14 @@
 # goxorro
 
-A high-performance Go command line application for XOR-based compression using prime number patterns.
+A Go command line application for XOR-based compression using prime number patterns with experimental sparse data compression techniques.
 
 ## Features
 
 - **XOR Pattern Compression**: Uses 1029 precomputed prime numbers (2-8209) to find optimal bit patterns
 - **Configurable Prime Testing**: Control compression speed vs thoroughness with `-primes` flag
 - **Intelligent Prime Selection**: Tests primes to achieve maximum zeros (95% threshold for early termination)
-- **Gzip Final Compression**: Applies gzip to the optimized bit streams for maximum efficiency
-- **Delimited File Format**: Separated metadata and data sections with clear delimiters
+- **Adaptive Sparse Compression**: Experimental techniques for post-XOR sparse data compression
+- **Multiple File Formats**: Format v1 (basic) and v2 (streaming with experimental compression)
 - **Compact 11-bit Metadata**: Efficient prime index encoding using bit packing
 - **Lossless Round-trip**: Perfect data integrity with reversible compression/decompression
 - **Verbose Logging**: Detailed algorithm analysis with `-v` flag
@@ -20,9 +20,25 @@ A high-performance Go command line application for XOR-based compression using p
 2. **Conditional Negation**: Negates bits if more ones than zeros initially
 3. **Prime XOR Testing**: Tests configurable number of primes to find patterns that maximize zeros
 4. **Iterative Optimization**: Continues XOR operations until no improvement possible
-5. **Gzip Compression**: Final compression of entire optimized file
-6. **Delimited Storage**: Separates data chunks and metadata with clear section delimiters
-7. **Metadata Encoding**: 11-bit packed prime indices with chunk delimiters for minimal overhead
+5. **Sparse Data Compression**: Applies experimental compression to post-XOR sparse data
+6. **Streaming Format**: Format v2 stores metadata with each chunk for streaming decompression
+7. **Adaptive Compression**: Automatically selects best compression method based on data characteristics
+
+## Experimental Compression Research
+
+This project has explored several approaches to compress sparse binary data remaining after XOR optimization:
+
+### Tested Approaches
+- **Combinadic Numbers**: Mathematical representation of bit combinations - effective for very sparse data but computationally expensive
+- **Bit Position Encoding**: Stores positions of 1-bits with delta compression - good for sparse data (92% of original size)
+- **Run-Length Encoding**: Encodes consecutive runs of 0s and 1s - ineffective for random data
+- **Adaptive Compression**: Automatically selects bit positions (<30% density) or RLE (≥30% density)
+
+### Key Findings
+- **Random dense data** (~50% ones): No compression method is effective (entropy is already maximal)
+- **Sparse data** (<30% ones): Bit position encoding provides ~8% space savings
+- **Structured data**: RLE can be effective for patterns with long runs
+- **Raw storage** is often most efficient for post-XOR data due to its already-compressed nature
 
 ## Building
 
